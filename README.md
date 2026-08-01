@@ -7,7 +7,7 @@
 不是外挂，是你的猜手搭档 —— 帮你算最优猜测、替你打字，**提交与否由你决定**。
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version: 0.2.6](https://img.shields.io/badge/version-0.2.6-green.svg)
+![Version: 0.2.7](https://img.shields.io/badge/version-0.2.7-green.svg)
 ![Tampermonkey](https://img.shields.io/badge/userscript-Tampermonkey-orange.svg)
 
 </div>
@@ -49,7 +49,7 @@
 - 🌐 **多人联机自动接管** — 匹配/建房对局自动接管；DOM 轮询解析反馈（不依赖 WebSocket）；自动检测本局/整场结束、停止填充等待下一局；重赛（rematch）自动续接
 - ⚡ **可选自动提交**（多人）— 填入后自动点击提交，支持冷却重试与昵称一致性校验；默认关闭，一键开关
 - 📊 **经验积累** — 本地记录各难度下被猜中的选手，用于候选排序，越玩越懂你的对手
-- 📦 **选手库自动获取** — 默认从 GitHub 数据仓库（csgo-major-db）拉取选手数据；网络异常时回退本地导入 `players_full.json`；反馈数据自动回写修正本地属性
+- 📦 **选手库自动获取** — 默认从 GitHub 数据仓库（csgo-major-db）拉取选手数据；启动时检测数据仓库更新并提示；网络异常时回退本地导入 `players_full.json`；反馈数据自动回写修正本地属性
 - 🎛 **全功能可开关** — 自动填入、自动提交均可通过油猴菜单随时切换
 
 ## 安装
