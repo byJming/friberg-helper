@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         弗一把助手
 // @namespace    shnlfriberg.helper
-// @version      0.2.7
+// @version      0.2.8
 // @description  弗一把(CSGO 选手猜测)开源辅助：求解最优猜测并填入输入框，单人与多人联机自动接管，提交与否由你决定
 // @match        https://shnlfriberg.online/*
 // @homepageURL  https://github.com/byJming/friberg-helper
@@ -45,8 +45,9 @@
       const s = GM_getValue(KEY_SETTINGS, null) || {};
       if (s.autoFill === undefined) s.autoFill = true;
       if (s.autoSubmit === undefined) s.autoSubmit = false;
+      if (!s.handicap) s.handicap = { enabled: false, minGuesses: 3, delaySec: 8, loseRate: 0.2 };
       return s;
-    } catch (e) { return { autoFill: true, autoSubmit: false }; }
+    } catch (e) { return { autoFill: true, autoSubmit: false, handicap: { enabled: false, minGuesses: 3, delaySec: 8, loseRate: 0.2 } }; }
   }
   function saveSettings(s) {
     try { GM_setValue(KEY_SETTINGS, s); } catch (e) { /* quota */ }
@@ -225,8 +226,48 @@
     fillPending: null,
     lastRound: null,
     ended: false,
-    autoSubmit: { pending: false, lastClick: 0, nextAttemptAt: 0 },
+    handicapLose: false,
+    handicapSkipDone: false,
+    awaitingRow: false,
+    awaitingRowAt: 0,
+    autoSubmit: { pending: false, lastClick: 0, nextAttemptAt: 0, delayUntil: 0 },
   };
+
+  // ---------- 控场模式（多人） ----------
+  // 目标：避免快速碾压导致对手没有体验。本局掷骰放水时直接跳过（判负），
+  // 否则限制每局最少猜测次数、并延迟提交，拉长对局节奏。
+  function handicapEnabled() {
+    return loadSettings().handicap.enabled;
+  }
+
+  function handicapConfig() {
+    return loadSettings().handicap;
+  }
+
+  // 每局开始时掷骰，决定本局是否放水
+  function rollHandicapLose() {
+    const h = handicapConfig();
+    multi.handicapLose = h.enabled && Math.random() < h.loseRate;
+    multi.handicapSkipDone = false;
+    return multi.handicapLose;
+  }
+
+  // 提交前延迟（毫秒），控场开启时在 0.5s~delaySec 之间随机
+  function handicapDelayMs() {
+    const h = handicapConfig();
+    if (!h.enabled || !h.delaySec) return 0;
+    return Math.floor((0.5 + Math.random() * h.delaySec) * 1000);
+  }
+
+  // 放水：点击"跳过本局"按钮（lucide-skip-forward 图标定位，语言无关）
+  function clickSkipButton() {
+    const svg = document.querySelector('svg.lucide-skip-forward');
+    if (!svg) return false;
+    const btn = svg.closest('button');
+    if (!btn || btn.disabled) return false;
+    btn.click();
+    return true;
+  }
 
   // 提交链路参数：按钮需等 React 异步刷新自动补全列表后才可点；
   // 服务端有 1.5s 猜间隔冷却，重试必须留出余量。
@@ -657,7 +698,15 @@
       setStatus('多人：候选集已空（数据异常）');
       return;
     }
-    const g = pickGuess(enc, cands, all, multi.guessed, 8 - multi.turn);
+    // 放水局：不填不猜，等 pollMulti 点「跳过本局」
+    if (multi.handicapLose) return;
+    let g = pickGuess(enc, cands, all, multi.guessed, 8 - multi.turn);
+    // 控场：每局最少猜测次数——候选集足够大时故意不猜最优，随机探路
+    const h = handicapConfig();
+    if (h.enabled && multi.turn < h.minGuesses && cands.length > 2) {
+      const others = cands.filter(c => c !== g);
+      if (others.length) g = others[Math.floor(Math.random() * others.length)];
+    }
     multi.lastIdx = g;
     renderPanel({ mode: multi.mode, cands: cands.length, total: enc.n, turn: multi.turn, max: 8, nick: enc.nicks[g], exp: 0, statusLine });
     if (loadSettings().autoFill) {
@@ -668,8 +717,10 @@
   function fillMulti(nickname) {
     if (!fillInput(nickname, 12, 300)) return false;
     multi.fillPending = null;
+    multi.awaitingRow = false;
+    multi.awaitingRowAt = 0;
     if (loadSettings().autoSubmit) {
-      multi.autoSubmit = { pending: true, lastClick: 0, nextAttemptAt: 0 };
+      multi.autoSubmit = { pending: true, lastClick: 0, nextAttemptAt: 0, delayUntil: Date.now() + handicapDelayMs() };
       void waitSubmitButton(nickname);
     }
     return true;
@@ -680,6 +731,10 @@
     let waited = 0;
     const tick = () => {
       if (multi.autoSubmit !== my || !my.pending) return;
+      if (Date.now() < my.delayUntil) {
+        setTimeout(tick, SUBMIT_RETRY_MS);
+        return;
+      }
       if (Date.now() < my.nextAttemptAt) {
         setTimeout(tick, SUBMIT_RETRY_MS);
         return;
@@ -723,6 +778,10 @@
       const input = document.querySelector('input[role="combobox"]');
       if (input && input.value.trim() === '') {
         my.pending = false;
+        // 提交成功前端会清空输入框，但行要等 React 渲染才出现。
+        // 在行确认前禁止再填同一选手，否则重复提交（服务端 duplicate 又清空）死循环。
+        multi.awaitingRow = true;
+        multi.awaitingRowAt = Date.now();
         return;
       }
       waited++;
@@ -776,6 +835,9 @@
       multi.lastRound = round;
       multi.ended = roundEnded;
       multi.autoSubmit.pending = false;
+      multi.awaitingRow = false;
+      multi.awaitingRowAt = 0;
+      rollHandicapLose();
       setStatus(`多人对局（${MODE_NAMES[multi.mode] || '?'}）已接管`);
       if (roundEnded) {
         multi.lastAnswer = answerText;
@@ -795,7 +857,10 @@
       multi.lastIdx = -1;
       multi.fillPending = null;
       multi.ended = false;
-      multi.autoSubmit = { pending: false, lastClick: 0 };
+      multi.autoSubmit = { pending: false, lastClick: 0, nextAttemptAt: 0, delayUntil: 0 };
+      multi.awaitingRow = false;
+      multi.awaitingRowAt = 0;
+      rollHandicapLose();
       computeMultiFill();
       multi.lastRound = round;
       return;
@@ -821,20 +886,33 @@
         multi.lastIdx = -1;
         multi.fillPending = null;
         multi.ended = false;
-        multi.autoSubmit = { pending: false, lastClick: 0 };
+        multi.autoSubmit = { pending: false, lastClick: 0, nextAttemptAt: 0, delayUntil: 0 };
+        multi.awaitingRow = false;
+        multi.awaitingRowAt = 0;
+        rollHandicapLose();
         computeMultiFill();
       } else {
         multi.lastRowCount = n;
       }
       return;
     }
+    // 放水局：不填不猜，点「跳过本局」判负
+    if (multi.handicapLose && !multi.handicapSkipDone) {
+      if (clickSkipButton()) multi.handicapSkipDone = true;
+      return;
+    }
     if (multi.lastIdx < 0 && enc && multi.candidates.length > 0) {
       computeMultiFill();
+    }
+    // 提交后等待行确认：3 秒仍未出现则视为未成功（如服务端 duplicate 只清空输入不添行），解除等待继续
+    if (multi.awaitingRow && Date.now() - multi.awaitingRowAt > 3000) {
+      multi.awaitingRow = false;
+      multi.awaitingRowAt = 0;
     }
     if (multi.fillPending) {
       if (fillMulti(multi.fillPending)) multi.fillPending = null;
     }
-    if (multi.lastIdx >= 0 && multi.turn === 0) {
+    if (multi.lastIdx >= 0 && multi.turn === 0 && !multi.awaitingRow) {
       const input = document.querySelector('input[role="combobox"]');
       if (input && !input.disabled && input.value === '' && !multi.autoSubmit.pending) {
         fillMulti(enc.nicks[multi.lastIdx]);
@@ -846,16 +924,27 @@
       multi.candidates = all.slice();
       multi.lastRowCount = 0;
       multi.fillPending = null;
+      multi.awaitingRow = false;
+      multi.awaitingRowAt = 0;
+      rollHandicapLose();
       computeMultiFill();
     }
     if (n > multi.lastRowCount) {
+      multi.awaitingRow = false;
+      multi.awaitingRowAt = 0;
       const row = rows[n - 1];
       const nickEl = row.querySelector('td.name');
       const nick = nickEl ? nickEl.textContent.trim() : '';
       const key = keyFromRow(row);
       const gIdx = nick ? enc.nicks.indexOf(nick) : -1;
       if (gIdx >= 0) {
-        multi.candidates = filterCandidates(enc, multi.candidates, gIdx, key);
+        const filtered = filterCandidates(enc, multi.candidates, gIdx, key);
+        if (filtered.length === 0) {
+          // 反馈无法匹配任何候选（行渲染过渡态等）：保留原候选集继续对局，不卡死
+          setStatus('多人：反馈未能匹配候选集，已跳过本轮过滤');
+        } else {
+          multi.candidates = filtered;
+        }
         multi.guessed.add(gIdx);
         multi.turn = n;
         computeMultiFill();
@@ -870,6 +959,8 @@
       const input = document.querySelector('input[role="combobox"]');
       if (input && input.value.trim() === '') {
         multi.autoSubmit.pending = false;
+        multi.awaitingRow = true;
+        multi.awaitingRowAt = Date.now();
         return;
       }
       if (Date.now() >= multi.autoSubmit.nextAttemptAt) {
@@ -972,12 +1063,39 @@
         .fb-status{font-size:11px;color:#8a93a2;word-break:break-all}
         .fb-exp{margin-top:8px;border-top:1px solid #33383f;padding-top:6px;font-size:11px;color:#8a93a2}
         .fb-exp ul{margin:4px 0 0;padding-left:14px}
+        .fb-hc{display:none;margin-top:8px;padding:8px;border:1px solid #3a3f4b;border-radius:8px;background:#161a22;font-size:12px}
+        .fb-hc.open{display:block}
+        .fb-hc label{display:flex;justify-content:space-between;align-items:center;margin:4px 0}
+        .fb-hc input[type=number]{width:56px;background:#111318;color:#e8e8e8;border:1px solid #3a3f4b;border-radius:4px;padding:2px 4px}
+        .fb-hc select{background:#111318;color:#e8e8e8;border:1px solid #3a3f4b;border-radius:4px;padding:2px 4px}
+        .fb-hc-btns{display:flex;gap:6px;margin-top:8px}
+        .fb-hc-btns button{flex:1;padding:4px 0;border-radius:5px;border:0;cursor:pointer;font-size:12px;color:#fff}
       </style>
       <div class="fb-panel">
         <div class="fb-title"><span>弗一把助手</span><span class="fb-mode" id="fb-mode">-</span></div>
         <div class="fb-cand" id="fb-cand">-</div>
         <div class="fb-guess" id="fb-guess">等待对局...</div>
         <button class="fb-btn" id="fb-autosubmit" style="background:#2b3444">多人自动提交：关</button>
+        <button class="fb-btn" id="fb-handicap" style="background:#2b3444">控场：关</button>
+        <div class="fb-hc" id="fb-hc">
+          <label><span>控场模式</span><input type="checkbox" id="hc-enabled"></label>
+          <label><span>每局最少猜测</span><input type="number" id="hc-min" min="0" max="8" step="1"></label>
+          <label><span>提交延迟（秒）</span><input type="number" id="hc-delay" min="0" max="20" step="1"></label>
+          <label><span>放水概率</span>
+            <select id="hc-lose">
+              <option value="0">0%</option>
+              <option value="0.1">10%</option>
+              <option value="0.2">20%</option>
+              <option value="0.3">30%</option>
+              <option value="0.4">40%</option>
+              <option value="0.5">50%</option>
+            </select>
+          </label>
+          <div class="fb-hc-btns">
+            <button id="hc-save" style="background:#2f6f3f">保存</button>
+            <button id="hc-close" style="background:#2b3444">关闭</button>
+          </div>
+        </div>
         <button class="fb-btn" id="fb-import" style="background:#2b3444">导入 JSON</button>
         <button class="fb-btn" id="fb-sync" style="background:#2b3444">同步选手库</button>
         <div class="fb-status" id="fb-status">就绪</div>
@@ -1001,6 +1119,40 @@
       updateAutoSubmitButton();
     });
     updateAutoSubmitButton();
+    function updateHandicapButton() {
+      const el = shadow.getElementById('fb-handicap');
+      if (!el) return;
+      const h = loadSettings().handicap;
+      el.textContent = `控场：${h.enabled ? '开' : '关'}`;
+      el.style.background = h.enabled ? '#2f6f3f' : '#2b3444';
+    }
+    function fillHandicapForm() {
+      const h = loadSettings().handicap;
+      shadow.getElementById('hc-enabled').checked = h.enabled;
+      shadow.getElementById('hc-min').value = h.minGuesses;
+      shadow.getElementById('hc-delay').value = h.delaySec;
+      shadow.getElementById('hc-lose').value = String(h.loseRate);
+    }
+    shadow.getElementById('fb-handicap').addEventListener('click', () => {
+      const box = shadow.getElementById('fb-hc');
+      box.classList.toggle('open');
+      if (box.classList.contains('open')) fillHandicapForm();
+    });
+    shadow.getElementById('hc-close').addEventListener('click', () => {
+      shadow.getElementById('fb-hc').classList.remove('open');
+    });
+    shadow.getElementById('hc-save').addEventListener('click', () => {
+      const s = loadSettings();
+      const min = Math.min(8, Math.max(0, Math.floor(Number(shadow.getElementById('hc-min').value) || 0)));
+      const delay = Math.min(20, Math.max(0, Math.floor(Number(shadow.getElementById('hc-delay').value) || 0)));
+      const lose = Number(shadow.getElementById('hc-lose').value);
+      s.handicap = { enabled: shadow.getElementById('hc-enabled').checked, minGuesses: min, delaySec: delay, loseRate: Number.isFinite(lose) ? lose : 0 };
+      saveSettings(s);
+      updateHandicapButton();
+      shadow.getElementById('fb-hc').classList.remove('open');
+      setStatus(`控场已${s.handicap.enabled ? '开启' : '关闭'}（最少 ${min} 猜 · 延迟 ${delay}s · 放水 ${Math.round(s.handicap.loseRate * 100)}%）`);
+    });
+    updateHandicapButton();
     shadow.getElementById('fb-import').addEventListener('click', importFromFile);
     shadow.getElementById('fb-sync').addEventListener('click', async () => {
       shadow.getElementById('fb-sync').disabled = true;
