@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         弗一把助手
 // @namespace    shnlfriberg.helper
-// @version      0.2.9
+// @version      0.2.10
 // @description  弗一把(CSGO 选手猜测)开源辅助：求解最优猜测并填入输入框，单人与多人联机自动接管，提交与否由你决定
 // @match        https://shnlfriberg.online/*
 // @homepageURL  https://github.com/byJming/friberg-helper
@@ -222,6 +222,7 @@
     turn: 0,
     candidates: [],
     guessed: new Set(),
+    submitted: new Set(),
     lastIdx: -1,
     lastRowCount: 0,
     lastAnswer: '',
@@ -232,7 +233,9 @@
     handicapSkipDone: false,
     awaitingRow: false,
     awaitingRowAt: 0,
-    autoSubmit: { pending: false, lastClick: 0, nextAttemptAt: 0, delayUntil: 0 },
+    pendingIdx: -1,
+    nextSubmitAt: 0,
+    autoSubmit: { pending: false, attempted: false, expected: '', lastClick: 0, nextAttemptAt: 0, delayUntil: 0 },
   };
 
   // ---------- 控场模式（多人） ----------
@@ -276,6 +279,7 @@
   const SUBMIT_RETRY_MS = 60;
   const SUBMIT_WAIT_BUTTON_MAX = 30;
   const SUBMIT_CONFIRM_TIMEOUT = 2500;
+  const SUBMIT_ROW_TIMEOUT = 6000;
   const GUESS_COOLDOWN_MS = 1600;
 
   // ---------- 数据同步 ----------
@@ -702,11 +706,19 @@
     }
     // 放水局：不填不猜，等 pollMulti 点「跳过本局」
     if (multi.handicapLose) return;
-    let g = pickGuess(enc, cands, all, multi.guessed, 8 - multi.turn);
+    const excluded = new Set([...multi.guessed, ...multi.submitted]);
+    const available = cands.filter(c => !excluded.has(c));
+    let g = available.length
+      ? pickGuess(enc, cands, all, excluded, 8 - multi.turn)
+      : all.find(c => !excluded.has(c));
+    if (g === undefined || g < 0) {
+      setStatus('多人：本局已无未提交选手');
+      return;
+    }
     // 控场：每局最少猜测次数——候选集足够大时故意不猜最优，随机探路
     const h = handicapConfig();
-    if (h.enabled && multi.turn < h.minGuesses && cands.length > 2) {
-      const others = cands.filter(c => c !== g);
+    if (h.enabled && multi.turn < h.minGuesses && available.length > 2) {
+      const others = available.filter(c => c !== g);
       if (others.length) g = others[Math.floor(Math.random() * others.length)];
     }
     multi.lastIdx = g;
@@ -717,12 +729,21 @@
   }
 
   function fillMulti(nickname) {
-    if (!fillInput(nickname, 12, 300)) return false;
+    // 多人轮询本身负责重试，不能再让 fillInput 排队；否则旧定时器会覆盖下一轮昵称。
+    const input = document.querySelector('input[role="combobox"]');
+    if (!input || input.disabled || !fillInput(nickname, 0, 300)) return false;
     multi.fillPending = null;
     multi.awaitingRow = false;
     multi.awaitingRowAt = 0;
     if (loadSettings().autoSubmit) {
-      multi.autoSubmit = { pending: true, lastClick: 0, nextAttemptAt: 0, delayUntil: Date.now() + handicapDelayMs() };
+      multi.autoSubmit = {
+        pending: true,
+        attempted: false,
+        expected: nickname,
+        lastClick: 0,
+        nextAttemptAt: 0,
+        delayUntil: Date.now() + handicapDelayMs(),
+      };
       void waitSubmitButton(nickname);
     }
     return true;
@@ -732,12 +753,16 @@
     const my = multi.autoSubmit;
     let waited = 0;
     const tick = () => {
-      if (multi.autoSubmit !== my || !my.pending) return;
+      if (multi.autoSubmit !== my || !my.pending || my.attempted) return;
       if (Date.now() < my.delayUntil) {
         setTimeout(tick, SUBMIT_RETRY_MS);
         return;
       }
       if (Date.now() < my.nextAttemptAt) {
+        setTimeout(tick, SUBMIT_RETRY_MS);
+        return;
+      }
+      if (Date.now() < multi.nextSubmitAt) {
         setTimeout(tick, SUBMIT_RETRY_MS);
         return;
       }
@@ -762,6 +787,11 @@
       }
       my.lastClick = Date.now();
       my.nextAttemptAt = my.lastClick + GUESS_COOLDOWN_MS;
+      my.attempted = true;
+      multi.pendingIdx = enc ? enc.nicks.indexOf(expected) : -1;
+      // 自动提交已在脚本侧等待冷却，点击后立即保留该昵称，避免晚回执触发重复提交。
+      if (multi.pendingIdx >= 0) multi.submitted.add(multi.pendingIdx);
+      multi.nextSubmitAt = my.lastClick + GUESS_COOLDOWN_MS;
       btn.click();
       waitSubmitConfirm(expected);
     };
@@ -780,15 +810,19 @@
       const input = document.querySelector('input[role="combobox"]');
       if (input && input.value.trim() === '') {
         my.pending = false;
+        if (multi.pendingIdx >= 0) multi.submitted.add(multi.pendingIdx);
         // 提交成功前端会清空输入框，但行要等 React 渲染才出现。
-        // 在行确认前禁止再填同一选手，否则重复提交（服务端 duplicate 又清空）死循环。
+        // 在行确认前禁止继续填充，避免状态尚未同步时抢跑下一次猜测。
         multi.awaitingRow = true;
         multi.awaitingRowAt = Date.now();
         return;
       }
       waited++;
       if (waited * SUBMIT_RETRY_MS >= SUBMIT_CONFIRM_TIMEOUT) {
-        waitSubmitButton(expected);
+        // 页面会在 5 秒请求超时后主动同步房间；这里转入行确认阶段。
+        my.pending = false;
+        multi.awaitingRow = true;
+        multi.awaitingRowAt = my.lastClick || Date.now();
         return;
       }
       setTimeout(tick, SUBMIT_RETRY_MS);
@@ -801,6 +835,55 @@
     const rows = table ? table.querySelectorAll('tbody tr') : [];
     const last = rows.length ? rows[rows.length - 1] : null;
     return Boolean(last && last.classList.contains('row-correct'));
+  }
+
+  function trackMultiSubmit(event) {
+    if (!location.pathname.startsWith('/multi') || !multi.active || multi.ended) return;
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement) || !form.matches('.input-bar')) return;
+    const btn = form.querySelector('button.btn');
+    const input = form.querySelector('input[role="combobox"]');
+    if (!btn || btn.disabled || !input) return;
+    const gIdx = enc ? enc.nicks.indexOf(input.value.trim()) : -1;
+    if (gIdx < 0) return;
+    // submit 事件发生在 onPick 返回结果之前，不能在这里直接认为请求成功。
+    // 只有输入框清空或反馈表格新增行后，才把选手加入 submitted。
+    multi.pendingIdx = gIdx;
+    multi.nextSubmitAt = Date.now() + GUESS_COOLDOWN_MS;
+    multi.fillPending = null;
+    multi.awaitingRow = true;
+    multi.awaitingRowAt = Date.now();
+  }
+
+  function processMultiRows(rows, from) {
+    let processed = from;
+    for (let i = from; i < rows.length; i++) {
+      const row = rows[i];
+      const nickEl = row.querySelector('td.name');
+      const nick = nickEl ? nickEl.textContent.trim() : '';
+      if (!nick) break; // React 可能先插入空行，再补齐单元格内容
+      const gIdx = enc ? enc.nicks.indexOf(nick) : -1;
+      if (gIdx >= 0) {
+        const filtered = filterCandidates(enc, multi.candidates, gIdx, keyFromRow(row));
+        if (filtered.length === 0) {
+          // 反馈无法匹配任何候选（行渲染过渡态等）：保留原候选集继续对局，不卡死
+          setStatus('多人：反馈未能匹配候选集，已跳过本轮过滤');
+        } else {
+          multi.candidates = filtered;
+        }
+        multi.guessed.add(gIdx);
+        multi.submitted.add(gIdx);
+      } else {
+        setStatus(`多人：无法识别猜测「${nick}」，请同步数据`);
+      }
+      processed = i + 1;
+      if (row.classList.contains('row-correct')) multi.ended = true;
+    }
+    multi.turn = processed;
+    if (processed > from) {
+      multi.nextSubmitAt = Math.max(multi.nextSubmitAt, Date.now() + GUESS_COOLDOWN_MS);
+    }
+    return processed;
   }
 
   function pollMulti() {
@@ -830,6 +913,7 @@
       multi.active = true;
       multi.turn = 0;
       multi.guessed = new Set();
+      multi.submitted = new Set();
       multi.candidates = all.slice();
       multi.lastRowCount = 0;
       multi.lastAnswer = '';
@@ -839,14 +923,17 @@
       multi.autoSubmit.pending = false;
       multi.awaitingRow = false;
       multi.awaitingRowAt = 0;
+      multi.pendingIdx = -1;
+      multi.nextSubmitAt = 0;
       rollHandicapLose();
+      multi.lastRowCount = processMultiRows(rows, 0);
       setStatus(`多人对局（${MODE_NAMES[multi.mode] || '?'}）已接管`);
       if (roundEnded) {
         multi.lastAnswer = answerText;
         const won = multiLastRowWon(selfBoard);
         recordGame(multi.mode || 'normal', won, multi.turn, multi.lastAnswer);
         setStatus(`多人${won ? '获胜' : '失利'}：答案 ${multi.lastAnswer}（已记录）`);
-      } else {
+      } else if (!multi.ended) {
         computeMultiFill();
       }
       return;
@@ -854,16 +941,20 @@
     if (round !== null && round !== multi.lastRound) {
       multi.turn = 0;
       multi.guessed = new Set();
+      multi.submitted = new Set();
       multi.candidates = all.slice();
       multi.lastRowCount = 0;
       multi.lastIdx = -1;
       multi.fillPending = null;
       multi.ended = false;
-      multi.autoSubmit = { pending: false, lastClick: 0, nextAttemptAt: 0, delayUntil: 0 };
+      multi.autoSubmit = { pending: false, attempted: false, expected: '', lastClick: 0, nextAttemptAt: 0, delayUntil: 0 };
       multi.awaitingRow = false;
       multi.awaitingRowAt = 0;
+      multi.pendingIdx = -1;
+      multi.nextSubmitAt = 0;
       rollHandicapLose();
-      computeMultiFill();
+      multi.lastRowCount = processMultiRows(rows, 0);
+      if (!multi.ended) computeMultiFill();
       multi.lastRound = round;
       return;
     }
@@ -883,16 +974,20 @@
       if (n < multi.lastRowCount) {
         multi.turn = 0;
         multi.guessed = new Set();
+        multi.submitted = new Set();
         multi.candidates = all.slice();
-        multi.lastRowCount = n;
+        multi.lastRowCount = 0;
         multi.lastIdx = -1;
         multi.fillPending = null;
         multi.ended = false;
-        multi.autoSubmit = { pending: false, lastClick: 0, nextAttemptAt: 0, delayUntil: 0 };
+        multi.autoSubmit = { pending: false, attempted: false, expected: '', lastClick: 0, nextAttemptAt: 0, delayUntil: 0 };
         multi.awaitingRow = false;
         multi.awaitingRowAt = 0;
+        multi.pendingIdx = -1;
+        multi.nextSubmitAt = 0;
         rollHandicapLose();
-        computeMultiFill();
+        multi.lastRowCount = processMultiRows(rows, 0);
+        if (!multi.ended) computeMultiFill();
       } else {
         multi.lastRowCount = n;
       }
@@ -903,70 +998,78 @@
       if (clickSkipButton()) multi.handicapSkipDone = true;
       return;
     }
-    if (multi.lastIdx < 0 && enc && multi.candidates.length > 0) {
-      computeMultiFill();
-    }
-    // 提交后等待行确认：3 秒仍未出现则视为未成功（如服务端 duplicate 只清空输入不添行），解除等待继续
-    if (multi.awaitingRow && Date.now() - multi.awaitingRowAt > 3000) {
+    if (n < multi.lastRowCount) {
+      multi.turn = 0;
+      multi.guessed = new Set();
+      multi.submitted = new Set();
+      multi.candidates = all.slice();
+      multi.lastRowCount = 0;
+      multi.lastIdx = -1;
+      multi.fillPending = null;
+      multi.autoSubmit = { pending: false, attempted: false, expected: '', lastClick: 0, nextAttemptAt: 0, delayUntil: 0 };
       multi.awaitingRow = false;
       multi.awaitingRowAt = 0;
+      multi.pendingIdx = -1;
+      multi.nextSubmitAt = 0;
+      rollHandicapLose();
+      multi.lastRowCount = processMultiRows(rows, 0);
+      if (!multi.ended) computeMultiFill();
+      return;
+    }
+    if (n > multi.lastRowCount) {
+      const processed = processMultiRows(rows, multi.lastRowCount);
+      if (processed > multi.lastRowCount) {
+        multi.awaitingRow = false;
+        multi.awaitingRowAt = 0;
+        multi.lastRowCount = processed;
+        multi.pendingIdx = -1;
+        const last = rows[processed - 1];
+        if (last && last.classList.contains('row-correct')) {
+          multi.ended = true;
+          multi.autoSubmit.pending = false;
+        } else {
+          computeMultiFill();
+        }
+        return;
+      }
+    }
+    // 手动提交只在页面清空输入框后确认；自动提交在点击时已保留对应昵称。
+    if (multi.awaitingRow) {
+      const input = document.querySelector('input[role="combobox"]');
+      if (input && input.value.trim() === '' && multi.pendingIdx >= 0) {
+        multi.submitted.add(multi.pendingIdx);
+      }
+      if (Date.now() - multi.awaitingRowAt <= SUBMIT_ROW_TIMEOUT) return;
+      multi.awaitingRow = false;
+      multi.awaitingRowAt = 0;
+      multi.pendingIdx = -1;
+      computeMultiFill();
+      return;
+    }
+    if (multi.lastIdx < 0 && enc && multi.candidates.length > 0) {
+      computeMultiFill();
     }
     if (multi.fillPending) {
       if (fillMulti(multi.fillPending)) multi.fillPending = null;
     }
-    if (multi.lastIdx >= 0 && multi.turn === 0 && !multi.awaitingRow) {
+    if (multi.lastIdx >= 0 && multi.turn === 0) {
       const input = document.querySelector('input[role="combobox"]');
       if (input && !input.disabled && input.value === '' && !multi.autoSubmit.pending) {
         fillMulti(enc.nicks[multi.lastIdx]);
       }
     }
-    if (n < multi.lastRowCount) {
-      multi.turn = 0;
-      multi.guessed = new Set();
-      multi.candidates = all.slice();
-      multi.lastRowCount = 0;
-      multi.fillPending = null;
-      multi.awaitingRow = false;
-      multi.awaitingRowAt = 0;
-      rollHandicapLose();
-      computeMultiFill();
-    }
-    if (n > multi.lastRowCount) {
-      multi.awaitingRow = false;
-      multi.awaitingRowAt = 0;
-      const row = rows[n - 1];
-      const nickEl = row.querySelector('td.name');
-      const nick = nickEl ? nickEl.textContent.trim() : '';
-      const key = keyFromRow(row);
-      const gIdx = nick ? enc.nicks.indexOf(nick) : -1;
-      if (gIdx >= 0) {
-        const filtered = filterCandidates(enc, multi.candidates, gIdx, key);
-        if (filtered.length === 0) {
-          // 反馈无法匹配任何候选（行渲染过渡态等）：保留原候选集继续对局，不卡死
-          setStatus('多人：反馈未能匹配候选集，已跳过本轮过滤');
-        } else {
-          multi.candidates = filtered;
-        }
-        multi.guessed.add(gIdx);
-        multi.turn = n;
-        computeMultiFill();
-      } else {
-        setStatus(`多人：无法识别猜测「${nick}」，请同步数据`);
-      }
-      multi.lastRowCount = n;
-    } else {
-      multi.lastRowCount = n;
-    }
     if (multi.autoSubmit.pending && multi.lastIdx >= 0) {
       const input = document.querySelector('input[role="combobox"]');
       if (input && input.value.trim() === '') {
+        const submittedIdx = enc.nicks.indexOf(multi.autoSubmit.expected);
+        if (submittedIdx >= 0) multi.submitted.add(submittedIdx);
         multi.autoSubmit.pending = false;
         multi.awaitingRow = true;
         multi.awaitingRowAt = Date.now();
         return;
       }
-      if (Date.now() >= multi.autoSubmit.nextAttemptAt) {
-        waitSubmitButton(enc.nicks[multi.lastIdx]);
+      if (!multi.autoSubmit.attempted && Date.now() >= multi.autoSubmit.nextAttemptAt) {
+        waitSubmitButton(multi.autoSubmit.expected);
       }
     }
   }
@@ -1232,6 +1335,7 @@
     ensureEncoded();
     hookXHR();
     hookFetch();
+    document.addEventListener('submit', trackMultiSubmit, true);
     if (!document.querySelector('#friberg-helper')) createPanel();
     setStatus('就绪；若已有进行中的对局，请点「重新开始」让助手接管');
     ensureData().then(ok => {
