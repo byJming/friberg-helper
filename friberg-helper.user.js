@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         弗一把助手
 // @namespace    shnlfriberg.helper
-// @version      0.2.8
+// @version      0.2.9
 // @description  弗一把(CSGO 选手猜测)开源辅助：求解最优猜测并填入输入框，单人与多人联机自动接管，提交与否由你决定
 // @match        https://shnlfriberg.online/*
 // @homepageURL  https://github.com/byJming/friberg-helper
 // @supportURL   https://github.com/byJming/friberg-helper/issues
 // @downloadURL  https://github.com/byJming/friberg-helper/raw/main/friberg-helper.user.js
 // @run-at       document-start
+// @connect      raw.githubusercontent.com
+// @connect      api.github.com
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand

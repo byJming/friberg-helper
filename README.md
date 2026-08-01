@@ -7,7 +7,7 @@
 不是外挂，是你的猜手搭档 —— 帮你算最优猜测、替你打字，**提交与否由你决定**。
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version: 0.2.8](https://img.shields.io/badge/version-0.2.8-green.svg)
+![Version: 0.2.9](https://img.shields.io/badge/version-0.2.9-green.svg)
 ![Tampermonkey](https://img.shields.io/badge/userscript-Tampermonkey-orange.svg)
 
 </div>
@@ -61,7 +61,7 @@
 4. **首次使用**：无需手动操作，助手默认自动从 GitHub 数据仓库（csgo-major-db）获取选手库；网络不可用时，点面板「导入 JSON」选择本仓库 `data/players_full.json`（646 名选手）作为回退。
 > ⚠️ **重要提示：跨源资源访问授权**
 >
-> 首次使用同步选手库时，油猴（Tampermonkey / Violentmonkey）会弹出「该脚本请求访问跨源资源」的确认框——这是因为脚本需要从 GitHub 的 csgo-major-db 数据仓库拉取选手数据，属于脚本的正常功能，请点击**「临时允许」（仅本次）或「始终允许」（推荐）**。
+> 脚本已通过 `@connect` 声明访问域名白名单（`raw.githubusercontent.com` 与 `api.github.com`），Violentmonkey 与新版 Tampermonkey 通常不会再弹确认框；若旧版 Tampermonkey 首次仍弹出「该脚本请求访问跨源资源」，请点击**「临时允许」（仅本次）或「始终允许」（推荐）**。
 >
 > 如果拒绝了授权，脚本将无法联网获取数据，**不影响其他功能**——点面板「导入 JSON」，选择本仓库自带的 `data/players_full.json` 即可离线使用。
 
