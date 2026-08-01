@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         弗一把助手
 // @namespace    shnlfriberg.helper
-// @version      0.2.11
+// @version      0.3.0
 // @description  弗一把(CSGO 选手猜测)开源辅助：求解最优猜测并填入输入框，单人与多人联机自动接管，提交与否由你决定
 // @match        https://shnlfriberg.online/*
 // @homepageURL  https://github.com/byJming/friberg-helper
@@ -29,7 +29,9 @@
   const MAJOR_CLOSE = 1;
   const MODE_NAMES = { beginner: '入门版', easy: '简单版', normal: '完整版' };
 
-  // ---------- 存储 ----------
+  // ---------- 存储（带内存缓存，避免热路径反复读 GM 存储） ----------
+  let _statsCache = null;
+  let _settingsCache = null;
   function loadPlayersCache() {
     try { return GM_getValue(KEY_PLAYERS, null); } catch (e) { return null; }
   }
@@ -37,21 +39,44 @@
     try { GM_setValue(KEY_PLAYERS, cache); } catch (e) { /* quota */ }
   }
   function loadStats() {
-    try { return GM_getValue(KEY_STATS, { modes: {}, games: [] }); } catch (e) { return { modes: {}, games: [] }; }
+    if (_statsCache) return _statsCache;
+    try { _statsCache = GM_getValue(KEY_STATS, { modes: {}, games: [] }); } catch (e) { _statsCache = { modes: {}, games: [] }; }
+    return _statsCache;
   }
   function saveStats(stats) {
+    _statsCache = stats;
     try { GM_setValue(KEY_STATS, stats); } catch (e) { /* quota */ }
   }
+  const HANDICAP_DEFAULT = { enabled: false, minGuessesMin: 2, minGuessesMax: 4, delaySecMin: 5, delaySecMax: 12, loseRate: 0.2 };
   function loadSettings() {
+    if (_settingsCache) return _settingsCache;
     try {
       const s = GM_getValue(KEY_SETTINGS, null) || {};
       if (s.autoFill === undefined) s.autoFill = true;
       if (s.autoSubmit === undefined) s.autoSubmit = false;
-      if (!s.handicap) s.handicap = { enabled: false, minGuesses: 3, delaySec: 8, loseRate: 0.2 };
+      if (!s.handicap) { s.handicap = { ...HANDICAP_DEFAULT }; }
+      else {
+        // 兼容旧版固定值格式：迁移为区间
+        const h = s.handicap;
+        if (h.minGuessesMin === undefined) {
+          const old = h.minGuesses || 3;
+          h.minGuessesMin = Math.max(1, old - 1);
+          h.minGuessesMax = Math.min(6, old + 1);
+          delete h.minGuesses;
+        }
+        if (h.delaySecMin === undefined) {
+          const old = h.delaySec || 8;
+          h.delaySecMin = Math.max(2, old - 3);
+          h.delaySecMax = Math.min(20, old + 3);
+          delete h.delaySec;
+        }
+      }
+      _settingsCache = s;
       return s;
-    } catch (e) { return { autoFill: true, autoSubmit: false, handicap: { enabled: false, minGuesses: 3, delaySec: 8, loseRate: 0.2 } }; }
+    } catch (e) { _settingsCache = { autoFill: true, autoSubmit: false, handicap: { ...HANDICAP_DEFAULT } }; return _settingsCache; }
   }
   function saveSettings(s) {
+    _settingsCache = s;
     try { GM_setValue(KEY_SETTINGS, s); } catch (e) { /* quota */ }
   }
 
@@ -147,11 +172,29 @@
     return m ? (m.answers[nick] || 0) : 0;
   }
 
+  // 从 top-K 中加权随机选取，避免每步都选最优解触发服务端相似度检测。
+  // 服务端 userGameAnalysis 会计算每步的 entropyPercentile，
+  // 持续 top 1% 会导致 similarityIndex ≥ 90（“high” 等级）。
+  // 目标：平均百分位控制在 60~85%，模拟“聪明但非机器”的玩家。
+  const TOP_K = 4;
+  function pickFromTopK(scored) {
+    // scored: [{idx, score}] 已按 score 降序
+    if (scored.length <= 1) return scored[0] ? scored[0].idx : -1;
+    const k = Math.min(TOP_K, scored.length);
+    // 权重递减：第 1 名权重 k，第 2 名 k-1，...，第 k 名 1
+    const totalW = k * (k + 1) / 2;
+    let r = Math.random() * totalW;
+    for (let i = 0; i < k; i++) {
+      r -= (k - i);
+      if (r <= 0) return scored[i].idx;
+    }
+    return scored[k - 1].idx;
+  }
+
   function bestGuess(enc, candidates, pool) {
     const n = candidates.length;
     const counts = new Map();
-    let bestIdx = -1;
-    let bestEntropy = -Infinity;
+    const scored = [];
     for (const g of pool) {
       counts.clear();
       for (const a of candidates) {
@@ -163,17 +206,14 @@
         const p = c / n;
         e -= p * Math.log2(p);
       }
-      if (e > bestEntropy || (e === bestEntropy && (bestIdx < 0 || guessExperience(enc.nicks[g]) > guessExperience(enc.nicks[bestIdx])))) {
-        bestEntropy = e;
-        bestIdx = g;
-      }
+      scored.push({ idx: g, score: e });
     }
-    return bestIdx;
+    scored.sort((a, b) => b.score - a.score || guessExperience(enc.nicks[b.idx]) - guessExperience(enc.nicks[a.idx]));
+    return pickFromTopK(scored);
   }
 
   function minimaxGuess(enc, candidates, pool) {
-    let best = candidates[0];
-    let bestMax = Infinity;
+    const scored = [];
     for (const g of pool) {
       const counts = new Map();
       for (const a of candidates) {
@@ -182,12 +222,11 @@
       }
       let m = 0;
       for (const c of counts.values()) if (c > m) m = c;
-      if (m < bestMax || (m === bestMax && guessExperience(enc.nicks[g]) > guessExperience(enc.nicks[best]))) {
-        bestMax = m;
-        best = g;
-      }
+      // 分数取负：最大分区越小分数越高
+      scored.push({ idx: g, score: -m });
     }
-    return best;
+    scored.sort((a, b) => b.score - a.score || guessExperience(enc.nicks[b.idx]) - guessExperience(enc.nicks[a.idx]));
+    return pickFromTopK(scored);
   }
 
   function pickGuess(enc, candidates, pool, guessed, remaining) {
@@ -231,6 +270,10 @@
     ended: false,
     handicapLose: false,
     handicapSkipDone: false,
+    handicapRefIdx: -1,
+    handicapPadSeq: null,
+    handicapPadPos: 0,
+    roundMinGuesses: 0,
     awaitingRow: false,
     awaitingRowAt: 0,
     pendingIdx: -1,
@@ -241,6 +284,67 @@
   // ---------- 控场模式（多人） ----------
   // 目标：避免快速碾压导致对手没有体验。本局掷骰放水时直接跳过（判负），
   // 否则限制每局最少猜测次数、并延迟提交，拉长对局节奏。
+  // 探路采用「候选内渐进逼近」策略：
+  // - 每步都有正向 information gain（候选内选取，不触发断层检测）
+  // - 按与参照目标的距离从远到近分桶，反馈面板呈现逐步变绿的视觉效果
+  // - 始终排除最可能的答案，保证探路期间不会提前命中
+
+  // 计算选手 a 到选手 b 的属性距离（0 = 完全相同，越大越远）
+  function guessDistance(a, b) {
+    let d = 0;
+    if (enc.nats[a] !== enc.nats[b]) d += (enc.regs[a] === enc.regs[b] ? 1 : 2);
+    if (enc.regs[a] !== enc.regs[b]) d += 1;
+    if (enc.teams[a] !== enc.teams[b]) d += 1;
+    d += Math.min(Math.abs(enc.ages[a] - enc.ages[b]) / AGE_CLOSE, 3);
+    if (enc.roles[a] !== enc.roles[b]) d += 1;
+    d += Math.min(Math.abs(enc.mcs[a] - enc.mcs[b]), 3);
+    d += Math.min(Math.abs(enc.mas[a] - enc.mas[b]) * 0.5, 2);
+    // 活跃状态（权重 3：退役/现役差异会连带影响队伍+年龄+Major 多列反馈，视觉距离远大于单属性）
+    if (enc.acts[a] !== enc.acts[b]) d += 3;
+    return d;
+  }
+
+  // 控场探路：候选内渐进逼近 + 排除答案。
+  // 首次探路时生成固定序列（远 → 近），后续每步按序取用，
+  // 保证反馈严格从少绿到多绿过渡，不会因候选集缩小而重新排序导致反复。
+  function pickPaddingGuess(cands, excluded, paddingLeft) {
+    const available = cands.filter(c => !excluded.has(c));
+    if (available.length === 0) return -1;
+    // 尽早确定参照目标（最可能是答案），供 fallback 使用
+    if (multi.handicapRefIdx < 0 || !cands.includes(multi.handicapRefIdx)) {
+      multi.handicapRefIdx = available.slice().sort(
+        (a, b) => guessExperience(enc.nicks[b]) - guessExperience(enc.nicks[a])
+      )[0];
+    }
+    // 候选仅剩 1 人：它就是答案，从候选外选一个必不命中的
+    if (available.length === 1) {
+      const candsSet = new Set(cands);
+      const outside = all.filter(c => !candsSet.has(c) && !excluded.has(c));
+      return outside.length > 0 ? outside[Math.floor(Math.random() * outside.length)] : -1;
+    }
+    // 首次探路：生成固定序列（整局不变）
+    if (!multi.handicapPadSeq) {
+      const ref = multi.handicapRefIdx;
+      // 排除参照目标，按距离从远到近排序（远 = 少绿，近 = 多绿）
+      const pool = available.filter(c => c !== ref);
+      multi.handicapPadSeq = pool.slice().sort(
+        (a, b) => guessDistance(b, ref) - guessDistance(a, ref) // 降序：远在前
+      );
+      multi.handicapPadPos = 0;
+    }
+    // 从固定序列中按序取用（跳过已猜过的）
+    const seq = multi.handicapPadSeq;
+    while (multi.handicapPadPos < seq.length && excluded.has(seq[multi.handicapPadPos])) {
+      multi.handicapPadPos++;
+    }
+    if (multi.handicapPadPos < seq.length) {
+      return seq[multi.handicapPadPos++];
+    }
+    // 序列耗尽：回退到候选外
+    const candsSet = new Set(cands);
+    const outside = all.filter(c => !candsSet.has(c) && !excluded.has(c));
+    return outside.length > 0 ? outside[Math.floor(Math.random() * outside.length)] : -1;
+  }
   function handicapEnabled() {
     return loadSettings().handicap.enabled;
   }
@@ -249,19 +353,35 @@
     return loadSettings().handicap;
   }
 
-  // 每局开始时掷骰，决定本局是否放水
+  // 每局开始时掷骰：决定本局是否放水、本局最少猜测次数（从用户设定区间内随机）
   function rollHandicapLose() {
     const h = handicapConfig();
     multi.handicapLose = h.enabled && Math.random() < h.loseRate;
     multi.handicapSkipDone = false;
+    // 从 [minGuessesMin, minGuessesMax] 区间随机取本局最少猜测数
+    const lo = Math.max(1, h.minGuessesMin || 2);
+    const hi = Math.max(lo, Math.min(6, h.minGuessesMax || lo));
+    multi.roundMinGuesses = h.enabled ? lo + Math.floor(Math.random() * (hi - lo + 1)) : 0;
     return multi.handicapLose;
   }
 
-  // 提交前延迟（毫秒）：设置多少就等多少（固定值），保证延迟可预期、可精确执行
+  // 提交前延迟（毫秒）：始终在用户设定区间 [lo, hi] 内，
+  // 候选数只影响在区间内的偏移（候选多偏上界，候选少偏下界），不会突破下界。
   function handicapDelayMs() {
     const h = handicapConfig();
-    if (!h.enabled || !h.delaySec) return 0;
-    return h.delaySec * 1000;
+    if (!h.enabled) return 0;
+    const lo = Math.max(1, h.delaySecMin || 3);
+    const hi = Math.max(lo + 1, h.delaySecMax || lo + 1);
+    // 候选数决定在区间内的位置：候选多取上段，候选少取下段
+    const cands = multi.candidates.length;
+    let bias;
+    if (cands > 50) bias = 0.7 + Math.random() * 0.3;       // 70%~100% 位置
+    else if (cands > 15) bias = 0.4 + Math.random() * 0.3;  // 40%~70%
+    else bias = 0.1 + Math.random() * 0.3;                   // 10%~40%
+    const sec = lo + (hi - lo) * bias;
+    // 微小抖动 ±0.8s，保证不低于用户设定的最小值
+    const jitter = (Math.random() - 0.5) * 1.6;
+    return Math.max(lo * 1000, (sec + jitter) * 1000);
   }
 
   // 放水：点击"跳过本局"按钮（lucide-skip-forward 图标定位，语言无关）。
@@ -395,10 +515,8 @@
     return '同步失败：' + (err instanceof Error ? err.message : String(err));
   }
 
-  // 多人对局进行中更换选手库后，候选集/已猜索引会全部失效，
-  // 必须按新库重置状态并重放已有反馈行
-  function resetMultiAfterDataSync() {
-    if (!multi.active || !enc) return;
+  // 多人回合状态重置（新回合/行数减少/数据同步后统一调用）
+  function resetMultiRound() {
     multi.turn = 0;
     multi.guessed = new Set();
     multi.submitted = new Set();
@@ -406,11 +524,23 @@
     multi.lastRowCount = 0;
     multi.lastIdx = -1;
     multi.fillPending = null;
+    multi.ended = false;
     multi.autoSubmit = { pending: false, attempted: false, expected: '', lastClick: 0, nextAttemptAt: 0, delayUntil: 0 };
     multi.awaitingRow = false;
     multi.awaitingRowAt = 0;
     multi.pendingIdx = -1;
     multi.nextSubmitAt = 0;
+    multi.handicapRefIdx = -1;
+    multi.handicapPadSeq = null;
+    multi.handicapPadPos = 0;
+    rollHandicapLose();
+  }
+
+  // 多人对局进行中更换选手库后，候选集/已猜索引会全部失效，
+  // 必须按新库重置状态并重放已有反馈行
+  function resetMultiAfterDataSync() {
+    if (!multi.active || !enc) return;
+    resetMultiRound();
     if (multi.handicapLose) return;
     const selfBoard = document.querySelector('.player-board-self');
     const table = selfBoard ? selfBoard.querySelector('.game-table') : null;
@@ -775,17 +905,22 @@
       setStatus('多人：本局已无未提交选手');
       return;
     }
-    // 控场：每局最少猜测次数——候选外探路：猜已被反馈排除的选手（数据一致时必不命中），
-    // 其反馈仍按相同规则过滤候选（信息量无损，不降低 8 次内收敛能力）。
-    // 探路预算：探路后剩余步数仍需 >= 候选数（保证镜像选手组可逐个试完），否则回退最优；
-    // 无候选外选手可用（如首猜时全库均为候选）时保持最优猜测。
+    // 控场：每局最少猜测次数——候选内渐进探路。
+    // 核心约束：探路期间绝不提交答案，即使 pickPaddingGuess 失败也必须强制找一个非答案选手。
     const h = handicapConfig();
     const remaining = 8 - multi.turn;
-    if (h.enabled && multi.turn < h.minGuesses && remaining - 1 >= cands.length) {
-      const candsSet = new Set(cands);
+    if (h.enabled && multi.turn < multi.roundMinGuesses && remaining > 2) {
       const guessedAll = new Set([...multi.guessed, ...multi.submitted, ...(multi.pendingIdx >= 0 ? [multi.pendingIdx] : [])]);
-      const outside = all.filter(c => !candsSet.has(c) && !guessedAll.has(c));
-      if (outside.length > 0) g = bestGuess(enc, cands, outside);
+      const paddingLeft = multi.roundMinGuesses - multi.turn;
+      const pg = pickPaddingGuess(cands, guessedAll, paddingLeft);
+      if (pg >= 0) {
+        g = pg;
+      } else {
+        // 兆底：全库中找一个未猜过且非参照目标的选手，绝不回退到 pickGuess 的结果（可能是答案）
+        const ref = multi.handicapRefIdx;
+        const fallback = all.find(c => !guessedAll.has(c) && c !== ref);
+        if (fallback !== undefined) g = fallback;
+      }
     }
     multi.lastIdx = g;
     renderPanel({ mode: multi.mode, cands: cands.length, total: enc.n, turn: multi.turn, max: 8, nick: enc.nicks[g], exp: 0, statusLine });
@@ -977,24 +1112,17 @@
     const n = rows.length;
     const answerEl = document.querySelector('.overlay-card .answer-name');
     const answerText = answerEl ? answerEl.textContent.trim() : '';
-    const roundEnded = Boolean(answerText);
+    // 对手退出/断线时的结算弹窗也会含 .answer-name（显示对手信息），
+    // 通过弹窗文本识别并跳过，避免误报“选手库与服务器不一致”
+    const overlayText = document.querySelector('.overlay-card') ? document.querySelector('.overlay-card').innerText : '';
+    const isMatchOver = /退出了房间|离开|断线|disconnect|left|forfeit/i.test(overlayText);
+    const roundEnded = Boolean(answerText) && !isMatchOver;
     if (!multi.active) {
       multi.active = true;
-      multi.turn = 0;
-      multi.guessed = new Set();
-      multi.submitted = new Set();
-      multi.candidates = all.slice();
-      multi.lastRowCount = 0;
       multi.lastAnswer = '';
-      multi.fillPending = null;
       multi.lastRound = round;
+      resetMultiRound();
       multi.ended = roundEnded;
-      multi.autoSubmit.pending = false;
-      multi.awaitingRow = false;
-      multi.awaitingRowAt = 0;
-      multi.pendingIdx = -1;
-      multi.nextSubmitAt = 0;
-      rollHandicapLose();
       multi.lastRowCount = processMultiRows(rows, 0);
       setStatus(`多人对局（${MODE_NAMES[multi.mode] || '?'}）已接管`);
       if (roundEnded) {
@@ -1014,20 +1142,7 @@
       return;
     }
     if (round !== null && round !== multi.lastRound) {
-      multi.turn = 0;
-      multi.guessed = new Set();
-      multi.submitted = new Set();
-      multi.candidates = all.slice();
-      multi.lastRowCount = 0;
-      multi.lastIdx = -1;
-      multi.fillPending = null;
-      multi.ended = false;
-      multi.autoSubmit = { pending: false, attempted: false, expected: '', lastClick: 0, nextAttemptAt: 0, delayUntil: 0 };
-      multi.awaitingRow = false;
-      multi.awaitingRowAt = 0;
-      multi.pendingIdx = -1;
-      multi.nextSubmitAt = 0;
-      rollHandicapLose();
+      resetMultiRound();
       multi.lastRowCount = processMultiRows(rows, 0);
       if (!multi.ended) computeMultiFill();
       multi.lastRound = round;
@@ -1054,20 +1169,7 @@
     }
     if (multi.ended) {
       if (n < multi.lastRowCount) {
-        multi.turn = 0;
-        multi.guessed = new Set();
-        multi.submitted = new Set();
-        multi.candidates = all.slice();
-        multi.lastRowCount = 0;
-        multi.lastIdx = -1;
-        multi.fillPending = null;
-        multi.ended = false;
-        multi.autoSubmit = { pending: false, attempted: false, expected: '', lastClick: 0, nextAttemptAt: 0, delayUntil: 0 };
-        multi.awaitingRow = false;
-        multi.awaitingRowAt = 0;
-        multi.pendingIdx = -1;
-        multi.nextSubmitAt = 0;
-        rollHandicapLose();
+        resetMultiRound();
         multi.lastRowCount = processMultiRows(rows, 0);
         if (!multi.ended) computeMultiFill();
       } else {
@@ -1086,19 +1188,7 @@
       return;
     }
     if (n < multi.lastRowCount) {
-      multi.turn = 0;
-      multi.guessed = new Set();
-      multi.submitted = new Set();
-      multi.candidates = all.slice();
-      multi.lastRowCount = 0;
-      multi.lastIdx = -1;
-      multi.fillPending = null;
-      multi.autoSubmit = { pending: false, attempted: false, expected: '', lastClick: 0, nextAttemptAt: 0, delayUntil: 0 };
-      multi.awaitingRow = false;
-      multi.awaitingRowAt = 0;
-      multi.pendingIdx = -1;
-      multi.nextSubmitAt = 0;
-      rollHandicapLose();
+      resetMultiRound();
       multi.lastRowCount = processMultiRows(rows, 0);
       if (!multi.ended) computeMultiFill();
       return;
@@ -1247,74 +1337,173 @@
 
   function setStatus(text) {
     statusLine = text;
-    const el = panelRoot && panelRoot.querySelector('.fb-status');
+    if (!panelRoot) return;
+    const el = panelRoot.querySelector('.fb-status');
     if (el) el.textContent = text;
+    // 状态色条：警告/错误/正常
+    const bar = panelRoot.querySelector('.fb-status-bar');
+    if (bar) {
+      bar.className = 'fb-status-bar' + (
+        /失败|异常|不一致|警告/.test(text) ? ' warn' :
+        /获胜|成功|完成|就绪/.test(text) ? ' ok' : ''
+      );
+    }
   }
 
   function createPanel() {
     const host = document.createElement('div');
     host.id = 'friberg-helper';
-    host.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:999999;font-family:system-ui,sans-serif;';
+    host.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:999999;font-family:"Inter",system-ui,-apple-system,sans-serif;';
     const shadow = host.attachShadow({ mode: 'open' });
     shadow.innerHTML = `
       <style>
-        .fb-panel{width:230px;background:#111318;color:#e8e8e8;border:1px solid #3a3f4b;border-radius:10px;padding:10px 12px;box-shadow:0 6px 24px rgba(0,0,0,.5);font-size:13px;line-height:1.5}
-        .fb-title{font-weight:700;display:flex;justify-content:space-between;align-items:center}
-        .fb-mode{font-size:11px;color:#9aa3b2}
-        .fb-cand{margin:6px 0;color:#b9c0cc}
-        .fb-guess{font-size:15px;font-weight:700;color:#7dd87d;margin:4px 0 8px}
-        .fb-btn{width:100%;padding:6px 0;border-radius:6px;border:0;background:#2f6f3f;color:#fff;cursor:pointer;font-size:13px;margin-bottom:8px}
-        .fb-btn:hover{background:#3a8a50}
-        .fb-status{font-size:11px;color:#8a93a2;word-break:break-all}
-        .fb-exp{margin-top:8px;border-top:1px solid #33383f;padding-top:6px;font-size:11px;color:#8a93a2}
-        .fb-exp ul{margin:4px 0 0;padding-left:14px}
-        .fb-hc{display:none;margin-top:8px;padding:8px;border:1px solid #3a3f4b;border-radius:8px;background:#161a22;font-size:12px}
-        .fb-hc.open{display:block}
-        .fb-hc label{display:flex;justify-content:space-between;align-items:center;margin:4px 0}
-        .fb-hc input[type=number]{width:56px;background:#111318;color:#e8e8e8;border:1px solid #3a3f4b;border-radius:4px;padding:2px 4px}
-        .fb-hc select{background:#111318;color:#e8e8e8;border:1px solid #3a3f4b;border-radius:4px;padding:2px 4px}
+        *{box-sizing:border-box;margin:0;padding:0}
+        .fb-panel{width:248px;background:rgba(15,17,23,.92);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);color:#e4e7ec;border:1px solid rgba(255,255,255,.06);border-radius:14px;padding:0;box-shadow:0 8px 32px rgba(0,0,0,.55),0 0 0 1px rgba(255,255,255,.03) inset;font-size:13px;line-height:1.5;overflow:hidden;transition:opacity .25s,transform .25s}
+        .fb-panel.collapsed{opacity:0;transform:scale(.9) translateY(8px);pointer-events:none;height:0;padding:0;border:0}
+        /* 标题栏（可拖拽） */
+        .fb-header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px 8px;cursor:move;user-select:none;border-bottom:1px solid rgba(255,255,255,.05)}
+        .fb-header h1{font-size:13px;font-weight:600;letter-spacing:.3px;color:#f0f2f5}
+        .fb-header-right{display:flex;align-items:center;gap:8px}
+        .fb-mode{font-size:10px;color:#8b95a5;background:rgba(255,255,255,.05);padding:2px 7px;border-radius:20px}
+        .fb-collapse{width:20px;height:20px;border:0;background:rgba(255,255,255,.06);color:#8b95a5;border-radius:6px;cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center;transition:background .15s}
+        .fb-collapse:hover{background:rgba(255,255,255,.12);color:#fff}
+        /* 主体 */
+        .fb-body{padding:10px 14px 12px}
+        /* 对局信息 */
+        .fb-info{margin-bottom:10px}
+        .fb-cand{font-size:11px;color:#7c8698;margin-bottom:2px}
+        .fb-guess{font-size:18px;font-weight:700;color:#6ee7a0;letter-spacing:.2px;text-shadow:0 0 12px rgba(110,231,160,.15)}
+        .fb-guess.idle{color:#5a6375;font-size:13px;font-weight:400;text-shadow:none}
+        /* 开关组 */
+        .fb-toggles{display:flex;gap:6px;margin-bottom:10px}
+        .fb-toggle{flex:1;padding:6px 0;border-radius:8px;border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.03);color:#8b95a5;cursor:pointer;font-size:11px;font-weight:500;text-align:center;transition:all .18s}
+        .fb-toggle:hover{background:rgba(255,255,255,.07);color:#c8cdd6}
+        .fb-toggle.on{background:rgba(110,231,160,.1);border-color:rgba(110,231,160,.25);color:#6ee7a0}
+        /* 控场配置抽屉 */
+        .fb-hc{max-height:0;overflow:hidden;transition:max-height .3s ease,opacity .25s;opacity:0;margin-bottom:0}
+        .fb-hc.open{max-height:220px;opacity:1;margin-bottom:10px}
+        .fb-hc-inner{padding:10px;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);border-radius:10px}
+        .fb-hc-inner label{display:flex;justify-content:space-between;align-items:center;margin:5px 0;font-size:11px;color:#9aa3b2}
+        .fb-hc .range-row{display:flex;align-items:center;gap:3px}
+        .fb-hc input[type=number]{width:40px;background:rgba(0,0,0,.3);color:#e4e7ec;border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:3px 4px;text-align:center;font-size:11px;transition:border-color .15s}
+        .fb-hc input[type=number]:focus{border-color:rgba(110,231,160,.4);outline:none}
+        .fb-hc select{background:rgba(0,0,0,.3);color:#e4e7ec;border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:3px 6px;font-size:11px}
+        .fb-hc input[type=checkbox]{accent-color:#6ee7a0}
         .fb-hc-btns{display:flex;gap:6px;margin-top:8px}
-        .fb-hc-btns button{flex:1;padding:4px 0;border-radius:5px;border:0;cursor:pointer;font-size:12px;color:#fff}
+        .fb-hc-btns button{flex:1;padding:5px 0;border-radius:7px;border:0;cursor:pointer;font-size:11px;font-weight:500;color:#fff;transition:filter .15s}
+        .fb-hc-btns button:hover{filter:brightness(1.15)}
+        /* 数据操作 */
+        .fb-data{display:flex;gap:6px;margin-bottom:10px}
+        .fb-data button{flex:1;padding:6px 0;border-radius:8px;border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.03);color:#8b95a5;cursor:pointer;font-size:11px;transition:all .18s}
+        .fb-data button:hover{background:rgba(255,255,255,.08);color:#d0d5dd}
+        .fb-data button:disabled{opacity:.4;cursor:default}
+        /* 状态栏 */
+        .fb-status-wrap{position:relative;padding-left:10px}
+        .fb-status-bar{position:absolute;left:0;top:1px;bottom:1px;width:3px;border-radius:2px;background:#3d4450;transition:background .3s}
+        .fb-status-bar.ok{background:#6ee7a0}
+        .fb-status-bar.warn{background:#fbbf24}
+        .fb-status{font-size:10px;color:#6b7585;word-break:break-all;line-height:1.4}
+        /* 经验 */
+        .fb-exp{margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.05);font-size:10px;color:#5f6978}
+        .fb-exp ul{margin:3px 0 0;padding-left:12px;list-style:disc}
+        /* 收起态浮标 */
+        .fb-dot{width:36px;height:36px;border-radius:50%;background:rgba(15,17,23,.9);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.1);box-shadow:0 4px 16px rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;cursor:pointer;transition:transform .2s,box-shadow .2s;color:#6ee7a0;font-size:14px;font-weight:700}
+        .fb-dot:hover{transform:scale(1.1);box-shadow:0 6px 20px rgba(0,0,0,.5)}
+        .fb-dot.show{display:flex}
       </style>
-      <div class="fb-panel">
-        <div class="fb-title"><span>弗一把助手</span><span class="fb-mode" id="fb-mode">-</span></div>
-        <div class="fb-cand" id="fb-cand">-</div>
-        <div class="fb-guess" id="fb-guess">等待对局...</div>
-        <button class="fb-btn" id="fb-autosubmit" style="background:#2b3444">多人自动提交：关</button>
-        <button class="fb-btn" id="fb-handicap" style="background:#2b3444">控场：关</button>
-        <div class="fb-hc" id="fb-hc">
-          <label><span>控场模式</span><input type="checkbox" id="hc-enabled"></label>
-          <label><span>每局最少猜测</span><input type="number" id="hc-min" min="0" max="6" step="1"></label>
-          <label><span>提交延迟（秒）</span><input type="number" id="hc-delay" min="0" max="20" step="1"></label>
-          <label><span>放水概率</span>
-            <select id="hc-lose">
-              <option value="0">0%</option>
-              <option value="0.1">10%</option>
-              <option value="0.2">20%</option>
-              <option value="0.3">30%</option>
-              <option value="0.4">40%</option>
-              <option value="0.5">50%</option>
-            </select>
-          </label>
-          <div class="fb-hc-btns">
-            <button id="hc-save" style="background:#2f6f3f">保存</button>
-            <button id="hc-close" style="background:#2b3444">关闭</button>
+      <div class="fb-dot" id="fb-dot">弗</div>
+      <div class="fb-panel" id="fb-panel">
+        <div class="fb-header" id="fb-drag">
+          <h1>弗一把助手</h1>
+          <div class="fb-header-right">
+            <span class="fb-mode" id="fb-mode">-</span>
+            <button class="fb-collapse" id="fb-min" title="收起">─</button>
           </div>
         </div>
-        <button class="fb-btn" id="fb-import" style="background:#2b3444">导入 JSON</button>
-        <button class="fb-btn" id="fb-sync" style="background:#2b3444">同步选手库</button>
-        <div class="fb-status" id="fb-status">就绪</div>
-        <div class="fb-exp" id="fb-exp"></div>
+        <div class="fb-body">
+          <div class="fb-info">
+            <div class="fb-cand" id="fb-cand">等待对局</div>
+            <div class="fb-guess idle" id="fb-guess">─</div>
+          </div>
+          <div class="fb-toggles">
+            <button class="fb-toggle" id="fb-autosubmit">自动提交</button>
+            <button class="fb-toggle" id="fb-handicap">控场</button>
+          </div>
+          <div class="fb-hc" id="fb-hc">
+            <div class="fb-hc-inner">
+              <label><span>启用控场</span><input type="checkbox" id="hc-enabled"></label>
+              <label><span>最少猜测</span><span class="range-row"><input type="number" id="hc-min-lo" min="1" max="6" step="1"><span>~</span><input type="number" id="hc-min-hi" min="1" max="6" step="1"><span>次</span></span></label>
+              <label><span>提交延迟</span><span class="range-row"><input type="number" id="hc-delay-lo" min="0" max="20" step="1"><span>~</span><input type="number" id="hc-delay-hi" min="0" max="20" step="1"><span>秒</span></span></label>
+              <label><span>放水概率</span>
+                <select id="hc-lose">
+                  <option value="0">0%</option>
+                  <option value="0.1">10%</option>
+                  <option value="0.2">20%</option>
+                  <option value="0.3">30%</option>
+                  <option value="0.4">40%</option>
+                  <option value="0.5">50%</option>
+                </select>
+              </label>
+              <div class="fb-hc-btns">
+                <button id="hc-save" style="background:#2d8a56">保存</button>
+                <button id="hc-close" style="background:rgba(255,255,255,.08)">关闭</button>
+              </div>
+            </div>
+          </div>
+          <div class="fb-data">
+            <button id="fb-import">导入 JSON</button>
+            <button id="fb-sync">同步选手库</button>
+          </div>
+          <div class="fb-status-wrap">
+            <div class="fb-status-bar" id="fb-status-bar"></div>
+            <div class="fb-status" id="fb-status">就绪</div>
+          </div>
+          <div class="fb-exp" id="fb-exp"></div>
+        </div>
       </div>`;
     document.documentElement.appendChild(host);
     panel = host;
     panelRoot = shadow;
+
+    // --- 收起 / 展开 ---
+    const panelEl = shadow.getElementById('fb-panel');
+    const dotEl = shadow.getElementById('fb-dot');
+    shadow.getElementById('fb-min').addEventListener('click', () => {
+      panelEl.classList.add('collapsed');
+      dotEl.classList.add('show');
+    });
+    dotEl.addEventListener('click', () => {
+      panelEl.classList.remove('collapsed');
+      dotEl.classList.remove('show');
+    });
+
+    // --- 拖拽 ---
+    const drag = shadow.getElementById('fb-drag');
+    let dragging = false, dx = 0, dy = 0;
+    drag.addEventListener('pointerdown', e => {
+      if (e.target.closest('button')) return;
+      dragging = true;
+      const rect = host.getBoundingClientRect();
+      dx = e.clientX - rect.left;
+      dy = e.clientY - rect.top;
+      drag.setPointerCapture(e.pointerId);
+    });
+    drag.addEventListener('pointermove', e => {
+      if (!dragging) return;
+      host.style.right = 'auto';
+      host.style.bottom = 'auto';
+      host.style.left = (e.clientX - dx) + 'px';
+      host.style.top = (e.clientY - dy) + 'px';
+    });
+    drag.addEventListener('pointerup', () => { dragging = false; });
+
+    // --- 开关组 ---
     function updateAutoSubmitButton() {
       const el = shadow.getElementById('fb-autosubmit');
       if (!el) return;
       const on = loadSettings().autoSubmit;
-      el.textContent = `多人自动提交：${on ? '开' : '关'}`;
-      el.style.background = on ? '#2f6f3f' : '#2b3444';
+      el.classList.toggle('on', on);
+      el.textContent = on ? '自动提交 ✓' : '自动提交';
     }
     shadow.getElementById('fb-autosubmit').addEventListener('click', () => {
       const s = loadSettings();
@@ -1324,18 +1513,21 @@
       updateAutoSubmitButton();
     });
     updateAutoSubmitButton();
+
     function updateHandicapButton() {
       const el = shadow.getElementById('fb-handicap');
       if (!el) return;
       const h = loadSettings().handicap;
-      el.textContent = `控场：${h.enabled ? '开' : '关'}`;
-      el.style.background = h.enabled ? '#2f6f3f' : '#2b3444';
+      el.classList.toggle('on', h.enabled);
+      el.textContent = h.enabled ? '控场 ✓' : '控场';
     }
     function fillHandicapForm() {
       const h = loadSettings().handicap;
       shadow.getElementById('hc-enabled').checked = h.enabled;
-      shadow.getElementById('hc-min').value = h.minGuesses;
-      shadow.getElementById('hc-delay').value = h.delaySec;
+      shadow.getElementById('hc-min-lo').value = h.minGuessesMin;
+      shadow.getElementById('hc-min-hi').value = h.minGuessesMax;
+      shadow.getElementById('hc-delay-lo').value = h.delaySecMin;
+      shadow.getElementById('hc-delay-hi').value = h.delaySecMax;
       shadow.getElementById('hc-lose').value = String(h.loseRate);
     }
     shadow.getElementById('fb-handicap').addEventListener('click', () => {
@@ -1348,16 +1540,21 @@
     });
     shadow.getElementById('hc-save').addEventListener('click', () => {
       const s = loadSettings();
-      const min = Math.min(6, Math.max(0, Math.floor(Number(shadow.getElementById('hc-min').value) || 0)));
-      const delay = Math.min(20, Math.max(0, Math.floor(Number(shadow.getElementById('hc-delay').value) || 0)));
+      const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, Math.floor(v) || 0));
+      const minLo = clamp(Number(shadow.getElementById('hc-min-lo').value), 1, 6);
+      const minHi = clamp(Number(shadow.getElementById('hc-min-hi').value), minLo, 6);
+      const delayLo = clamp(Number(shadow.getElementById('hc-delay-lo').value), 0, 20);
+      const delayHi = clamp(Number(shadow.getElementById('hc-delay-hi').value), delayLo, 20);
       const lose = Number(shadow.getElementById('hc-lose').value);
-      s.handicap = { enabled: shadow.getElementById('hc-enabled').checked, minGuesses: min, delaySec: delay, loseRate: Number.isFinite(lose) ? lose : 0 };
+      s.handicap = { enabled: shadow.getElementById('hc-enabled').checked, minGuessesMin: minLo, minGuessesMax: minHi, delaySecMin: delayLo, delaySecMax: delayHi, loseRate: Number.isFinite(lose) ? lose : 0 };
       saveSettings(s);
       updateHandicapButton();
       shadow.getElementById('fb-hc').classList.remove('open');
-      setStatus(`控场已${s.handicap.enabled ? '开启' : '关闭'}（最少 ${min} 猜 · 延迟 ${delay}s · 放水 ${Math.round(s.handicap.loseRate * 100)}%）`);
+      setStatus(`控场已${s.handicap.enabled ? '开启' : '关闭'}（${minLo}~${minHi} 猜 · ${delayLo}~${delayHi}s · 放水 ${Math.round(s.handicap.loseRate * 100)}%）`);
     });
     updateHandicapButton();
+
+    // --- 数据操作 ---
     shadow.getElementById('fb-import').addEventListener('click', importFromFile);
     shadow.getElementById('fb-sync').addEventListener('click', async () => {
       shadow.getElementById('fb-sync').disabled = true;
@@ -1365,7 +1562,7 @@
         setStatus('正在从 GitHub 数据仓库同步选手库...');
         const ok = await syncFromGitHub();
         if (ok) {
-          setStatus(`选手库同步完成（v${cache.version}，${cache.players.length} 人）；若与服务器不一致，请改用「导入 JSON」`);
+          setStatus(`选手库同步完成（v${cache.version}，${cache.players.length} 人）`);
         }
       } finally {
         shadow.getElementById('fb-sync').disabled = false;
@@ -1380,19 +1577,24 @@
     panelRoot.getElementById('fb-mode').textContent = MODE_NAMES[info.mode] || info.mode || '多人';
     panelRoot.getElementById('fb-cand').textContent = `候选 ${info.cands}/${info.total} · 已猜 ${info.turn}/${info.max}`;
     const g = panelRoot.getElementById('fb-guess');
-    g.textContent = info.nick || '-';
-    if (info.exp > 0) g.textContent += `（该难度见过 ${info.exp} 次）`;
+    if (info.nick) {
+      g.textContent = info.nick;
+      g.classList.remove('idle');
+    } else {
+      g.textContent = '─';
+      g.classList.add('idle');
+    }
     panelRoot.getElementById('fb-status').textContent = statusLine;
     const stats = loadStats();
     const m = stats.modes[info.mode];
     if (m && m.games > 0) {
-      const top = Object.entries(m.answers).sort((a, b) => b[1] - a[1]).slice(0, 5)
+      const top = Object.entries(m.answers).sort((a, b) => b[1] - a[1]).slice(0, 3)
         .map(([n, c]) => `<li>${n} ×${c}</li>`).join('');
       panelRoot.getElementById('fb-exp').innerHTML =
-        `经验：${m.games} 局 / 胜 ${m.wins}（${Math.round(100 * m.wins / m.games)}%）/ 平均 ${(m.guesses / m.games).toFixed(1)} 步` +
+        `${m.games} 局 · 胜 ${m.wins}（${Math.round(100 * m.wins / m.games)}%）· 均 ${(m.guesses / m.games).toFixed(1)} 步` +
         (top ? `<ul>${top}</ul>` : '');
     } else {
-      panelRoot.getElementById('fb-exp').textContent = '经验：暂无（打完一局自动积累）';
+      panelRoot.getElementById('fb-exp').textContent = '';
     }
   }
 
@@ -1425,7 +1627,29 @@
       pollMulti();
     }, 30);
   }
-
+  
+  // MutationObserver 管理：仅监听对局面板容器，避免全页面 DOM 变动（动画/tooltip）触发无效轮询
+  let boardObserver = null;
+  let observedBoard = null;
+  function manageBoardObserver() {
+    if (!location.pathname.startsWith('/multi')) {
+      if (boardObserver) { boardObserver.disconnect(); boardObserver = null; observedBoard = null; }
+      return;
+    }
+    const board = document.querySelector('.player-board-self');
+    if (board && board !== observedBoard) {
+      if (boardObserver) boardObserver.disconnect();
+      boardObserver = new MutationObserver(scheduleSync);
+      boardObserver.observe(board, { childList: true, subtree: true });
+      observedBoard = board;
+    } else if (!board && boardObserver) {
+      // 面板尚未渲染（React 还没挂载）：临时监听 body 等待出现
+      boardObserver.disconnect();
+      boardObserver.observe(document.body, { childList: true, subtree: true });
+      observedBoard = null;
+    }
+  }
+  
   function boot() {
     cache = loadPlayersCache();
     ensureEncoded();
@@ -1437,15 +1661,14 @@
     ensureData().then(ok => {
       if (ok) checkDbUpdate();
     }).catch(e => setStatus('选手库加载失败：' + e.message));
-    // 事件驱动为主（新行/回合结束立即响应），快速轮询兜底
+    // 事件驱动为主（新行/回合结束立即响应），快速轮询兖底
     if (typeof MutationObserver === 'function') {
-      new MutationObserver(scheduleSync).observe(document.documentElement, {
-        childList: true,
-        subtree: true,
-      });
+      boardObserver = new MutationObserver(scheduleSync);
+      boardObserver.observe(document.body, { childList: true, subtree: true });
     }
     setInterval(() => {
       if (!document.querySelector('#friberg-helper')) createPanel();
+      manageBoardObserver();
       pollMulti();
     }, 500);
   }
