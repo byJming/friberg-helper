@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         弗一把助手
 // @namespace    shnlfriberg.helper
-// @version      0.2.10
+// @version      0.2.11
 // @description  弗一把(CSGO 选手猜测)开源辅助：求解最优猜测并填入输入框，单人与多人联机自动接管，提交与否由你决定
 // @match        https://shnlfriberg.online/*
 // @homepageURL  https://github.com/byJming/friberg-helper
@@ -257,18 +257,34 @@
     return multi.handicapLose;
   }
 
-  // 提交前延迟（毫秒），控场开启时在 0.5s~delaySec 之间随机
+  // 提交前延迟（毫秒）：设置多少就等多少（固定值），保证延迟可预期、可精确执行
   function handicapDelayMs() {
     const h = handicapConfig();
     if (!h.enabled || !h.delaySec) return 0;
-    return Math.floor((0.5 + Math.random() * h.delaySec) * 1000);
+    return h.delaySec * 1000;
   }
 
-  // 放水：点击"跳过本局"按钮（lucide-skip-forward 图标定位，语言无关）
+  // 放水：点击"跳过本局"按钮（lucide-skip-forward 图标定位，语言无关）。
+  // 页面跳过前会弹确认对话框（ConfirmDialog），必须先点按钮再点确认，
+  // 否则放水局既不猜也不跳，对局会卡在确认框上。
   function clickSkipButton() {
     const svg = document.querySelector('svg.lucide-skip-forward');
     if (!svg) return false;
     const btn = svg.closest('button');
+    if (!btn || btn.disabled) return false;
+    btn.click();
+    return true;
+  }
+
+  // 确认「跳过本轮」对话框：按标题关键词识别（覆盖中/英/日文案），
+  // 避免误点用户正在操作的其它确认框（如退出房间）；确认成功返回 true。
+  const SKIP_CONFIRM_KEYWORDS = ['跳过', 'Skip', 'スキップ'];
+  function clickSkipConfirm() {
+    const dialog = document.querySelector('.confirm-dialog[role="alertdialog"]');
+    if (!dialog) return false;
+    const title = dialog.querySelector('h2');
+    if (!title || !SKIP_CONFIRM_KEYWORDS.some(w => title.textContent.includes(w))) return false;
+    const btn = dialog.querySelector('.btn-warning, .btn-danger');
     if (!btn || btn.disabled) return false;
     btn.click();
     return true;
@@ -279,7 +295,7 @@
   const SUBMIT_RETRY_MS = 60;
   const SUBMIT_WAIT_BUTTON_MAX = 30;
   const SUBMIT_CONFIRM_TIMEOUT = 2500;
-  const SUBMIT_ROW_TIMEOUT = 6000;
+  const SUBMIT_ROW_TIMEOUT = 10000;
   const GUESS_COOLDOWN_MS = 1600;
 
   // ---------- 数据同步 ----------
@@ -356,7 +372,9 @@
     return { version: 'csgo-major-db', commitSha, players };
   }
 
-  // 启动后检查数据仓库是否有新版本（10 分钟冷却），有新提交则提示手动同步
+  // 启动后检查数据仓库是否有新版本（10 分钟冷却）。
+  // 注意：服务器数据库由管理员手工导入维护，可能与数据仓库不同步；
+  // 盲目同步到仓库最新反而会造成与服务器不一致，这里仅提示，不自动更新。
   let lastDbUpdateCheck = 0;
   function checkDbUpdate() {
     if (!cache || !cache.commitSha) return;
@@ -364,7 +382,7 @@
     lastDbUpdateCheck = Date.now();
     fetchDbCommitSha().then(sha => {
       if (sha && cache && cache.commitSha && sha !== cache.commitSha) {
-        setStatus('选手库数据仓库有新版本，点面板「同步选手库」更新');
+        setStatus('数据仓库有新版本；服务器数据库可能未同步到同一版本，请确认后再手动同步');
       }
     });
   }
@@ -375,6 +393,48 @@
   function syncErrorMessage(err) {
     if (err instanceof Error && SYNC_ERROR_TEXT[err.message]) return SYNC_ERROR_TEXT[err.message];
     return '同步失败：' + (err instanceof Error ? err.message : String(err));
+  }
+
+  // 多人对局进行中更换选手库后，候选集/已猜索引会全部失效，
+  // 必须按新库重置状态并重放已有反馈行
+  function resetMultiAfterDataSync() {
+    if (!multi.active || !enc) return;
+    multi.turn = 0;
+    multi.guessed = new Set();
+    multi.submitted = new Set();
+    multi.candidates = all.slice();
+    multi.lastRowCount = 0;
+    multi.lastIdx = -1;
+    multi.fillPending = null;
+    multi.autoSubmit = { pending: false, attempted: false, expected: '', lastClick: 0, nextAttemptAt: 0, delayUntil: 0 };
+    multi.awaitingRow = false;
+    multi.awaitingRowAt = 0;
+    multi.pendingIdx = -1;
+    multi.nextSubmitAt = 0;
+    if (multi.handicapLose) return;
+    const selfBoard = document.querySelector('.player-board-self');
+    const table = selfBoard ? selfBoard.querySelector('.game-table') : null;
+    const rows = table ? table.querySelectorAll('tbody tr') : [];
+    if (rows.length) multi.lastRowCount = processMultiRows(rows, 0);
+    if (!multi.ended) computeMultiFill();
+  }
+
+  // 从 GitHub 数据仓库同步选手库；同步后重置单人/多人对局状态。
+  // 警告：服务器数据库由管理员手工导入，可能落后于数据仓库；
+  // 若服务器未同步到仓库最新，使用「导入 JSON」导入与服务器一致的本地数据更稳妥。
+  async function syncFromGitHub() {
+    try {
+      const fresh = await fetchAllPlayers();
+      cache = fresh;
+      savePlayersCache(fresh);
+      ensureEncoded();
+      if (state.inGame) { state.candidates = all.slice(); state.guessed = new Set(); computeAndFill(); }
+      resetMultiAfterDataSync();
+      return true;
+    } catch (e) {
+      setStatus(syncErrorMessage(e));
+      return false;
+    }
   }
 
   function ensureEncoded() {
@@ -709,17 +769,23 @@
     const excluded = new Set([...multi.guessed, ...multi.submitted]);
     const available = cands.filter(c => !excluded.has(c));
     let g = available.length
-      ? pickGuess(enc, cands, all, excluded, 8 - multi.turn)
+      ? pickGuess(enc, cands, cands, excluded, 8 - multi.turn)
       : all.find(c => !excluded.has(c));
     if (g === undefined || g < 0) {
       setStatus('多人：本局已无未提交选手');
       return;
     }
-    // 控场：每局最少猜测次数——候选集足够大时故意不猜最优，随机探路
+    // 控场：每局最少猜测次数——候选外探路：猜已被反馈排除的选手（数据一致时必不命中），
+    // 其反馈仍按相同规则过滤候选（信息量无损，不降低 8 次内收敛能力）。
+    // 探路预算：探路后剩余步数仍需 >= 候选数（保证镜像选手组可逐个试完），否则回退最优；
+    // 无候选外选手可用（如首猜时全库均为候选）时保持最优猜测。
     const h = handicapConfig();
-    if (h.enabled && multi.turn < h.minGuesses && available.length > 2) {
-      const others = available.filter(c => c !== g);
-      if (others.length) g = others[Math.floor(Math.random() * others.length)];
+    const remaining = 8 - multi.turn;
+    if (h.enabled && multi.turn < h.minGuesses && remaining - 1 >= cands.length) {
+      const candsSet = new Set(cands);
+      const guessedAll = new Set([...multi.guessed, ...multi.submitted, ...(multi.pendingIdx >= 0 ? [multi.pendingIdx] : [])]);
+      const outside = all.filter(c => !candsSet.has(c) && !guessedAll.has(c));
+      if (outside.length > 0) g = bestGuess(enc, cands, outside);
     }
     multi.lastIdx = g;
     renderPanel({ mode: multi.mode, cands: cands.length, total: enc.n, turn: multi.turn, max: 8, nick: enc.nicks[g], exp: 0, statusLine });
@@ -768,7 +834,10 @@
       }
       const btn = document.querySelector('.input-bar button.btn');
       const input = document.querySelector('input[role="combobox"]');
-      if (!btn || !input) return;
+      if (!btn || !input) {
+        setTimeout(tick, SUBMIT_RETRY_MS);
+        return;
+      }
       const text = input.value.trim();
       if (!text) {
         my.pending = false;
@@ -933,6 +1002,12 @@
         const won = multiLastRowWon(selfBoard);
         recordGame(multi.mode || 'normal', won, multi.turn, multi.lastAnswer);
         setStatus(`多人${won ? '获胜' : '失利'}：答案 ${multi.lastAnswer}（已记录）`);
+        if (enc) {
+          const ansIdx = enc.nicks.indexOf(multi.lastAnswer);
+          if (ansIdx >= 0 && !multi.candidates.includes(ansIdx)) {
+            setStatus(`选手库与服务器不一致（答案「${multi.lastAnswer}」不在候选集），请点「同步选手库」更新`);
+          }
+        }
       } else if (!multi.ended) {
         computeMultiFill();
       }
@@ -968,6 +1043,13 @@
         const won = multiLastRowWon(selfBoard);
         recordGame(multi.mode || 'normal', won, multi.turn, multi.lastAnswer);
         setStatus(`多人${won ? '获胜' : '失利'}：答案 ${multi.lastAnswer}（已记录）`);
+        // 数据一致性校验：答案不在本地候选集中说明选手库已过期，反馈过滤会持续错位
+        if (enc) {
+          const ansIdx = enc.nicks.indexOf(multi.lastAnswer);
+          if (ansIdx >= 0 && !multi.candidates.includes(ansIdx)) {
+            setStatus(`选手库与服务器不一致（答案「${multi.lastAnswer}」不在候选集），请点「同步选手库」更新`);
+          }
+        }
       }
     }
     if (multi.ended) {
@@ -993,9 +1075,14 @@
       }
       return;
     }
-    // 放水局：不填不猜，点「跳过本局」判负
+    // 放水局：不填不猜，点「跳过本局」并确认对话框判负。
+    // 无确认框时点跳过按钮；出现跳过确认框后点确认才算完成，避免对局卡在确认框。
     if (multi.handicapLose && !multi.handicapSkipDone) {
-      if (clickSkipButton()) multi.handicapSkipDone = true;
+      if (!document.querySelector('.confirm-dialog[role="alertdialog"]')) {
+        clickSkipButton();
+      } else if (clickSkipConfirm()) {
+        multi.handicapSkipDone = true;
+      }
       return;
     }
     if (n < multi.lastRowCount) {
@@ -1061,11 +1148,24 @@
     if (multi.autoSubmit.pending && multi.lastIdx >= 0) {
       const input = document.querySelector('input[role="combobox"]');
       if (input && input.value.trim() === '') {
-        const submittedIdx = enc.nicks.indexOf(multi.autoSubmit.expected);
-        if (submittedIdx >= 0) multi.submitted.add(submittedIdx);
-        multi.autoSubmit.pending = false;
-        multi.awaitingRow = true;
-        multi.awaitingRowAt = Date.now();
+        if (multi.autoSubmit.attempted) {
+          // 已点击提交，页面清空输入框说明请求已发出：等待反馈行渲染
+          const submittedIdx = enc.nicks.indexOf(multi.autoSubmit.expected);
+          if (submittedIdx >= 0) multi.submitted.add(submittedIdx);
+          multi.autoSubmit.pending = false;
+          multi.awaitingRow = true;
+          multi.awaitingRowAt = Date.now();
+        } else {
+          // 尚未点击提交而输入框被清空（填充失败/被清空）：重新填入，保留原延迟窗口
+          const target = document.querySelector('input[role="combobox"]');
+          if (target && !target.disabled) {
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+            setter.call(target, multi.autoSubmit.expected);
+            target.dispatchEvent(new Event('input', { bubbles: true }));
+          } else {
+            multi.fillPending = multi.autoSubmit.expected;
+          }
+        }
         return;
       }
       if (!multi.autoSubmit.attempted && Date.now() >= multi.autoSubmit.nextAttemptAt) {
@@ -1184,7 +1284,7 @@
         <button class="fb-btn" id="fb-handicap" style="background:#2b3444">控场：关</button>
         <div class="fb-hc" id="fb-hc">
           <label><span>控场模式</span><input type="checkbox" id="hc-enabled"></label>
-          <label><span>每局最少猜测</span><input type="number" id="hc-min" min="0" max="8" step="1"></label>
+          <label><span>每局最少猜测</span><input type="number" id="hc-min" min="0" max="6" step="1"></label>
           <label><span>提交延迟（秒）</span><input type="number" id="hc-delay" min="0" max="20" step="1"></label>
           <label><span>放水概率</span>
             <select id="hc-lose">
@@ -1248,7 +1348,7 @@
     });
     shadow.getElementById('hc-save').addEventListener('click', () => {
       const s = loadSettings();
-      const min = Math.min(8, Math.max(0, Math.floor(Number(shadow.getElementById('hc-min').value) || 0)));
+      const min = Math.min(6, Math.max(0, Math.floor(Number(shadow.getElementById('hc-min').value) || 0)));
       const delay = Math.min(20, Math.max(0, Math.floor(Number(shadow.getElementById('hc-delay').value) || 0)));
       const lose = Number(shadow.getElementById('hc-lose').value);
       s.handicap = { enabled: shadow.getElementById('hc-enabled').checked, minGuesses: min, delaySec: delay, loseRate: Number.isFinite(lose) ? lose : 0 };
@@ -1263,14 +1363,10 @@
       shadow.getElementById('fb-sync').disabled = true;
       try {
         setStatus('正在从 GitHub 数据仓库同步选手库...');
-        const fresh = await fetchAllPlayers();
-        cache = fresh;
-        savePlayersCache(fresh);
-        ensureEncoded();
-        if (state.inGame) { state.candidates = all.slice(); state.guessed = new Set(); computeAndFill(); }
-        setStatus(`选手库同步完成（v${fresh.version}，${fresh.players.length} 人）`);
-      } catch (e) {
-        setStatus(syncErrorMessage(e));
+        const ok = await syncFromGitHub();
+        if (ok) {
+          setStatus(`选手库同步完成（v${cache.version}，${cache.players.length} 人）；若与服务器不一致，请改用「导入 JSON」`);
+        }
       } finally {
         shadow.getElementById('fb-sync').disabled = false;
       }
