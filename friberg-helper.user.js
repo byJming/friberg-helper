@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         弗一把助手
 // @namespace    shnlfriberg.helper
-// @version      0.2.2
+// @version      0.2.6
 // @description  弗一把(CSGO 选手猜测)开源辅助：求解最优猜测并填入输入框，单人与多人联机自动接管，提交与否由你决定
 // @match        https://shnlfriberg.online/*
 // @homepageURL  https://github.com/byJming/friberg-helper
@@ -11,6 +11,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_xmlhttpRequest
 // @license      MIT
 // ==/UserScript==
 
@@ -60,7 +61,6 @@
     const natMap = new Map(), regMap = new Map(), teamMap = new Map(), roleMap = new Map();
     const enc = {
       n: players.length,
-      ids: new Array(players.length),
       nicks: new Array(players.length),
       nats: new Array(players.length),
       regs: new Array(players.length),
@@ -72,7 +72,6 @@
       acts: new Array(players.length),
     };
     players.forEach((p, i) => {
-      enc.ids[i] = p.id;
       enc.nicks[i] = p.nickname;
       enc.nats[i] = code(natMap, p.nationality);
       enc.regs[i] = code(regMap, p.region);
@@ -131,8 +130,9 @@
     return k;
   }
 
-  function filterCandidates(enc, candidates, gIdx, key) {
-    return candidates.filter(c => feedbackKey(enc, gIdx, c) === key);
+  function filterCandidates(enc, candidates, gIdx, keys) {
+    const list = Array.isArray(keys) ? keys : [keys];
+    return candidates.filter(c => list.includes(feedbackKey(enc, gIdx, c)));
   }
 
   function bestGuess(enc, candidates, pool) {
@@ -213,32 +213,75 @@
     fillPending: null,
     lastRound: null,
     ended: false,
-    autoSubmit: { pending: false, lastClick: 0 },
+    autoSubmit: { pending: false, lastClick: 0, nextAttemptAt: 0 },
   };
 
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // 提交链路参数：按钮需等 React 异步刷新自动补全列表后才可点；
+  // 服务端有 1.5s 猜间隔冷却，重试必须留出余量。
+  const SUBMIT_RETRY_MS = 60;
+  const SUBMIT_WAIT_BUTTON_MAX = 30;
+  const SUBMIT_CONFIRM_TIMEOUT = 2500;
+  const GUESS_COOLDOWN_MS = 1600;
 
   // ---------- 数据同步 ----------
-  async function pageFetch(url, opts) {
-    return PAGE.fetch(url, opts);
+  const GITHUB_DB_URL = 'https://raw.githubusercontent.com/shnlfriberg/csgo-major-db/main/players.json';
+  const GITHUB_TIMEOUT_MS = 10_000;
+
+  // 从 GitHub 数据仓库拉取选手属性（snake_case、无 id）。
+  // 页面 CSP 的 connect-src 不含 raw.githubusercontent.com，必须用 GM_xmlhttpRequest
+  //（扩展沙箱执行，不受页面 CSP 与 CORS 限制），超时/网络错误抛出统一错误码。
+  function fetchGitHubDb() {
+    return new Promise((resolve, reject) => {
+      const fail = () => { clearTimeout(timer); reject(new Error('GITHUB_DB_UNAVAILABLE')); };
+      const timer = setTimeout(fail, GITHUB_TIMEOUT_MS);
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: GITHUB_DB_URL,
+        timeout: GITHUB_TIMEOUT_MS,
+        onload: res => {
+          clearTimeout(timer);
+          try {
+            const obj = JSON.parse(res.responseText);
+            if (Array.isArray(obj) && obj.length > 0) resolve(obj);
+            else fail();
+          } catch { fail(); }
+        },
+        onerror: fail,
+        ontimeout: fail,
+      });
+    });
   }
 
-  async function fetchAllPlayers(onProgress) {
-    const listR = await pageFetch('/api/players/list', { cache: 'no-store' });
-    const list = await listR.json();
-    const map = new Map();
-    for (const p of list.players) {
-      try {
-        const r = await pageFetch(`/api/players?search=${encodeURIComponent(p.nickname)}`, { cache: 'no-store' });
-        if (r.ok) {
-          const arr = await r.json();
-          for (const pl of arr) map.set(pl.id, pl);
-        }
-      } catch (e) { /* skip */ }
-      if (onProgress) onProgress(map.size, list.players.length);
-      await sleep(250);
-    }
-    return { version: list.version, players: [...map.values()].sort((a, b) => a.id - b.id) };
+  /**
+   * 选手库同步：完全从 csgo-major-db（csgofriberg 官方数据仓库）获取，不依赖游戏服务器，
+   * 避免服务器限流影响。数据仓库字段为 snake_case 且不含 id，这里统一转为脚本内部格式。
+   */
+  async function fetchAllPlayers() {
+    const dbPlayers = await fetchGitHubDb();
+    const players = dbPlayers
+      .map(p => ({
+        id: typeof p.id === 'number' ? p.id : null,
+        nickname: p.nickname,
+        nationality: p.nationality,
+        region: p.region,
+        team: p.team,
+        age: p.age,
+        role: p.role,
+        majorChampionships: p.major_championships,
+        majorAppearances: p.major_appearances,
+        isActive: p.is_active !== undefined ? p.is_active : true,
+        difficulties: Array.isArray(p.difficulties) ? p.difficulties : [],
+      }))
+      .sort((a, b) => a.nickname.localeCompare(b.nickname, 'zh-CN'));
+    return { version: 'csgo-major-db', players };
+  }
+
+  const SYNC_ERROR_TEXT = {
+    GITHUB_DB_UNAVAILABLE: 'GitHub 数据仓库不可用（网络问题），请用「导入 JSON」选择本地选手文件（如 data/players_full.json）',
+  };
+  function syncErrorMessage(err) {
+    if (err instanceof Error && SYNC_ERROR_TEXT[err.message]) return SYNC_ERROR_TEXT[err.message];
+    return '同步失败：' + (err instanceof Error ? err.message : String(err));
   }
 
   function ensureEncoded() {
@@ -255,29 +298,59 @@
       if (state.inGame && state.lastIdx < 0) computeAndFill();
       return true;
     }
-    setStatus('无选手库：点面板「导入 JSON」选择本地 players_full.json，或点「同步选手库」在线抓取');
-    return false;
+    // 首次使用无本地选手库：默认从 GitHub 数据仓库获取，失败回退到本地导入
+    setStatus('选手库为空：正在从 GitHub 数据仓库获取...');
+    try {
+      const fresh = await fetchAllPlayers();
+      cache = fresh;
+      savePlayersCache(fresh);
+      ensureEncoded();
+      setStatus(`选手库获取成功（v${fresh.version}，${fresh.players.length} 人）`);
+      return true;
+    } catch (e) {
+      setStatus(syncErrorMessage(e));
+      return false;
+    }
   }
 
   // ---------- 导入本地 JSON ----------
+  // 兼容两种格式：脚本内部格式（camelCase + 可选 id）与 csgo-major-db 数据仓库格式（snake_case、无 id）
+  function normalizePlayerFields(raw) {
+    const p = raw && typeof raw === 'object' ? raw : {};
+    return {
+      id: typeof p.id === 'number' ? p.id : null,
+      nickname: p.nickname,
+      nationality: p.nationality,
+      region: p.region,
+      team: p.team,
+      age: p.age,
+      role: p.role,
+      majorChampionships: p.majorChampionships !== undefined ? p.majorChampionships : p.major_championships,
+      majorAppearances: p.majorAppearances !== undefined ? p.majorAppearances : p.major_appearances,
+      isActive: p.isActive !== undefined ? p.isActive : (p.is_active !== undefined ? p.is_active : true),
+      difficulties: Array.isArray(p.difficulties) ? p.difficulties : [],
+    };
+  }
+
   function importPlayersFromJson(obj) {
-    let players = Array.isArray(obj) ? obj : obj && obj.players;
-    if (!Array.isArray(players) || players.length === 0) {
+    const raw = Array.isArray(obj) ? obj : obj && obj.players;
+    if (!Array.isArray(raw) || raw.length === 0) {
       return { ok: false, message: '格式无效：未找到 players 数组' };
     }
     const version = (obj && (obj.listVersion || obj.version)) || null;
-    const need = ['id', 'nickname', 'nationality', 'region', 'team', 'age', 'role', 'majorChampionships', 'majorAppearances', 'isActive'];
+    const players = raw.map(normalizePlayerFields);
+    const need = ['nickname', 'nationality', 'region', 'team', 'age', 'role', 'majorChampionships', 'majorAppearances'];
     const sample = players.find(p => p && typeof p === 'object');
     if (!sample) return { ok: false, message: '格式无效：选手数据为空' };
     const missing = need.filter(k => !(k in sample));
     if (missing.length > 0) {
       return { ok: false, message: '选手数据缺少字段：' + missing.join(', ') };
     }
-    const ids = new Set(players.map(p => p.id));
-    if (ids.size !== players.length) {
-      return { ok: false, message: '存在重复选手 id' };
+    const nicks = new Set(players.map(p => p.nickname));
+    if (nicks.size !== players.length) {
+      return { ok: false, message: '存在重复选手昵称' };
     }
-    players = players.slice().sort((a, b) => a.id - b.id);
+    players.sort((a, b) => a.nickname.localeCompare(b.nickname, 'zh-CN'));
     cache = { version, players };
     savePlayersCache(cache);
     ensureEncoded();
@@ -369,10 +442,10 @@
     const fb = data.feedback;
     const stats = loadStats();
     // 同步反馈中的权威属性到缓存库（下次对局生效）
-    if (fb.attributes) {
+    if (fb.attributes && fb.nickname) {
       const list = cache ? cache.players : null;
       if (list) {
-        const p = list.find(x => x.id === fb.playerId);
+        const p = list.find(x => x.nickname === fb.nickname);
         if (p) {
           const a = fb.attributes;
           p.nationality = a.nationality.value;
@@ -392,7 +465,8 @@
       return;
     }
     const key = feedbackKeyFromServer(fb.attributes);
-    const gIdx = enc.ids.indexOf(fb.playerId);
+    // 选手库来自数据仓库（无服务器 id），用昵称映射反馈
+    const gIdx = fb.nickname ? enc.nicks.indexOf(fb.nickname) : -1;
     if (gIdx >= 0) {
       state.candidates = filterCandidates(enc, state.candidates, gIdx, key);
       state.guessed.add(gIdx);
@@ -446,12 +520,13 @@
     if (loadSettings().autoFill) fillInput(enc.nicks[g]);
   }
 
-  function fillInput(nickname, attempts) {
+  function fillInput(nickname, attempts, retryMs) {
     if (attempts === undefined) attempts = 8;
+    if (retryMs === undefined) retryMs = 800;
     const input = document.querySelector('input[role="combobox"]');
     if (!input) {
       if (attempts > 0) {
-        setTimeout(() => fillInput(nickname, attempts - 1), 800);
+        setTimeout(() => fillInput(nickname, attempts - 1, retryMs), retryMs);
         setStatus('等待输入框出现...');
       } else {
         setStatus('未找到输入框，请在单人对局页使用');
@@ -460,7 +535,7 @@
     }
     if (input.disabled) {
       if (attempts > 0) {
-        setTimeout(() => fillInput(nickname, attempts - 1), 800);
+        setTimeout(() => fillInput(nickname, attempts - 1, retryMs), retryMs);
         setStatus('输入框不可用，等待页面加载完成...');
       } else {
         setStatus('输入框持续不可用，请手动填入');
@@ -476,6 +551,7 @@
 
   // ---------- 多人模式（DOM 轮询解析，不依赖 WebSocket） ----------
   function updateMultiModeFromText() {
+    if (multi.mode) return;
     const t = document.body.innerText;
     if (!t.includes('数据库') && !t.includes('第 1 局')) return;
     if (t.includes('入门版')) multi.mode = 'beginner';
@@ -483,7 +559,10 @@
     else if (t.includes('完整版')) multi.mode = 'normal';
   }
 
+  // 按列索引解析（列头走 i18n 翻译，不能依赖 data-label 文案）；
+  // 列顺序与页面一致：0 昵称, 1 队伍, 2 国家或地区, 3 年龄, 4 位置, 5 Major 冠军, 6 Major 次数, 7 状态
   function keyFromRow(row) {
+    const cells = row.cells;
     const lv = td => {
       const cls = td ? String(td.className) : '';
       if (cls.includes('correct')) return 0;
@@ -497,18 +576,22 @@
       if (cls.includes('close')) return 1;
       return td.querySelector('.dir svg.lucide-arrow-up') ? 2 : 3;
     };
-    const c = label => row.querySelector('td[data-label="' + label + '"]');
-    let k = 0;
-    const natLv = lv(c('国家或地区'));
-    k = k * 3 + natLv;
-    k = k * 3 + (natLv === 2 ? 2 : 0);
-    k = k * 3 + lv(c('队伍'));
-    k = k * 4 + num(c('年龄'));
-    k = k * 3 + lv(c('位置'));
-    k = k * 4 + num(c('Major 冠军'));
-    k = k * 4 + num(c('Major 次数'));
-    k = k * 3 + lv(c('状态'));
-    return k;
+    const natLv = lv(cells[2]);
+    // 多人反馈不含地区维度：同国(correct)或不同国同地区(close)时地区必相同；
+    // 国籍不同(wrong)时地区未知，两种编码都保留，避免错误排除同地区选手
+    const regionOptions = natLv === 2 ? [0, 2] : [0];
+    return regionOptions.map(region => {
+      let k = 0;
+      k = k * 3 + natLv;
+      k = k * 3 + region;
+      k = k * 3 + lv(cells[1]);
+      k = k * 4 + num(cells[3]);
+      k = k * 3 + lv(cells[4]);
+      k = k * 4 + num(cells[5]);
+      k = k * 4 + num(cells[6]);
+      k = k * 3 + lv(cells[7]);
+      return k;
+    });
   }
 
   function computeMultiFill() {
@@ -527,12 +610,75 @@
   }
 
   function fillMulti(nickname) {
-    if (!fillInput(nickname)) return false;
+    if (!fillInput(nickname, 12, 300)) return false;
     multi.fillPending = null;
     if (loadSettings().autoSubmit) {
-      multi.autoSubmit = { pending: true, lastClick: 0 };
+      multi.autoSubmit = { pending: true, lastClick: 0, nextAttemptAt: 0 };
+      void waitSubmitButton(nickname);
     }
     return true;
+  }
+
+  // 填值后按钮暂时 disabled（React 异步刷新自动补全列表），短间隔轮询等它可用
+  function waitSubmitButton(expected) {
+    const my = multi.autoSubmit;
+    let waited = 0;
+    const tick = () => {
+      if (multi.autoSubmit !== my || !my.pending) return;
+      if (Date.now() < my.nextAttemptAt) {
+        setTimeout(tick, SUBMIT_RETRY_MS);
+        return;
+      }
+      const btn = document.querySelector('.input-bar button.btn');
+      const input = document.querySelector('input[role="combobox"]');
+      if (!btn || !input) return;
+      const text = input.value.trim();
+      if (!text) {
+        my.pending = false;
+        return;
+      }
+      if (expected && text.toLowerCase() !== expected.toLowerCase()) {
+        my.pending = false;
+        return;
+      }
+      if (btn.disabled) {
+        if (waited < SUBMIT_WAIT_BUTTON_MAX) {
+          waited++;
+          setTimeout(tick, SUBMIT_RETRY_MS);
+        }
+        return;
+      }
+      my.lastClick = Date.now();
+      my.nextAttemptAt = my.lastClick + GUESS_COOLDOWN_MS;
+      btn.click();
+      waitSubmitConfirm(expected);
+    };
+    setTimeout(tick, SUBMIT_RETRY_MS);
+  }
+
+  // 提交成功时前端会清空输入框；被冷却/网络拒绝时输入框保留，等冷却后重试
+  function waitSubmitConfirm(expected) {
+    const my = multi.autoSubmit;
+    let waited = 0;
+    const tick = () => {
+      if (multi.autoSubmit !== my) return;
+      if (!multi.active || multi.ended) {
+        my.pending = false;
+        return;
+      }
+      const input = document.querySelector('input[role="combobox"]');
+      if (input && input.value.trim() === '') {
+        my.pending = false;
+        return;
+      }
+      waited++;
+      if (waited * SUBMIT_RETRY_MS >= SUBMIT_CONFIRM_TIMEOUT) {
+        waitSubmitButton(expected);
+        return;
+      }
+      setTimeout(tick, SUBMIT_RETRY_MS);
+    };
+    setTimeout(tick, SUBMIT_RETRY_MS);
   }
 
   function pollMulti() {
@@ -548,7 +694,8 @@
       }
       return;
     }
-    const roundM = document.body.innerText.match(/第 (\d+) 局/);
+    const statusEl = document.querySelector('.status-bar');
+    const roundM = statusEl ? statusEl.innerText.match(/第 (\d+) 局/) : null;
     const round = roundM ? Number(roundM[1]) : null;
     const table = selfBoard.querySelector('.game-table');
     const rows = table ? table.querySelectorAll('tbody tr') : [];
@@ -629,7 +776,7 @@
     }
     if (multi.lastIdx >= 0 && multi.turn === 0) {
       const input = document.querySelector('input[role="combobox"]');
-      if (input && !input.disabled && input.value === '') {
+      if (input && !input.disabled && input.value === '' && !multi.autoSubmit.pending) {
         fillMulti(enc.nicks[multi.lastIdx]);
       }
     }
@@ -659,23 +806,14 @@
     } else {
       multi.lastRowCount = n;
     }
-    if (multi.autoSubmit.pending) {
+    if (multi.autoSubmit.pending && multi.lastIdx >= 0) {
       const input = document.querySelector('input[role="combobox"]');
-      const btn = document.querySelector('.input-bar button.btn');
-      if (!input || !btn) return;
-      const text = input.value.trim();
-      if (!text) {
+      if (input && input.value.trim() === '') {
         multi.autoSubmit.pending = false;
-      } else if (Date.now() - multi.autoSubmit.lastClick > 3000) {
-        const expected = multi.lastIdx >= 0 ? enc.nicks[multi.lastIdx] : '';
-        if (expected && text.toLowerCase() !== expected.toLowerCase()) {
-          multi.autoSubmit.pending = false;
-        } else if (btn.disabled) {
-          if (input !== document.activeElement) input.focus();
-        } else {
-          multi.autoSubmit.lastClick = Date.now();
-          btn.click();
-        }
+        return;
+      }
+      if (Date.now() >= multi.autoSubmit.nextAttemptAt) {
+        waitSubmitButton(enc.nicks[multi.lastIdx]);
       }
     }
   }
@@ -684,7 +822,6 @@
   const START_RE = /\/api\/game\/start$/;
   const GUESS_RE = /\/api\/game\/[^/]+\/guess$/;
   const GIVEUP_RE = /\/api\/game\/[^/]+\/giveup$/;
-  const LIST_RE = /\/api\/players\/list/;
 
   let lastHandle = { key: '', at: 0 };
   function handleApi(method, url, data) {
@@ -699,10 +836,6 @@
       onGuess(data);
     } else if (method === 'POST' && GIVEUP_RE.test(url)) {
       onGiveup(data);
-    } else if (method === 'GET' && LIST_RE.test(url) && data.version) {
-      if (cache && cache.version !== data.version) {
-        setStatus(`选手库有新版本 v${data.version}（当前 v${cache.version}），点面板「同步」更新`);
-      }
     }
   }
 
@@ -721,7 +854,7 @@
           if (this.status === 200 && this.__fbUrl) {
             const url = this.__fbUrl;
             const m = this.__fbMethod;
-            if ((START_RE.test(url) && m === 'POST') || (GUESS_RE.test(url) && m === 'POST') || (GIVEUP_RE.test(url) && m === 'POST') || (LIST_RE.test(url) && m === 'GET')) {
+            if ((START_RE.test(url) && m === 'POST') || (GUESS_RE.test(url) && m === 'POST') || (GIVEUP_RE.test(url) && m === 'POST')) {
               const text = this.responseText;
               if (text && (text.startsWith('{') || text.startsWith('['))) {
                 handleApi(m, url, JSON.parse(text));
@@ -742,7 +875,7 @@
       const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
       return origFetch.apply(this, arguments).then(res => {
         try {
-          if (res.ok && ((START_RE.test(url) && method === 'POST') || (GUESS_RE.test(url) && method === 'POST') || (GIVEUP_RE.test(url) && method === 'POST') || (LIST_RE.test(url) && method === 'GET'))) {
+          if (res.ok && ((START_RE.test(url) && method === 'POST') || (GUESS_RE.test(url) && method === 'POST') || (GIVEUP_RE.test(url) && method === 'POST'))) {
             res.clone().json().then(d => handleApi(method, url, d)).catch(() => {});
           }
         } catch (e) { /* ignore */ }
@@ -801,14 +934,15 @@
     shadow.getElementById('fb-sync').addEventListener('click', async () => {
       shadow.getElementById('fb-sync').disabled = true;
       try {
-        const fresh = await fetchAllPlayers((done, total) => setStatus(`正在同步选手库 ${done}/${total} ...`));
+        setStatus('正在从 GitHub 数据仓库同步选手库...');
+        const fresh = await fetchAllPlayers();
         cache = fresh;
         savePlayersCache(fresh);
         ensureEncoded();
         if (state.inGame) { state.candidates = all.slice(); state.guessed = new Set(); computeAndFill(); }
         setStatus(`选手库同步完成（v${fresh.version}，${fresh.players.length} 人）`);
       } catch (e) {
-        setStatus('同步失败：' + e.message);
+        setStatus(syncErrorMessage(e));
       } finally {
         shadow.getElementById('fb-sync').disabled = false;
       }
@@ -858,6 +992,16 @@
   });
 
   // ---------- 启动 ----------
+  let syncQueued = false;
+  function scheduleSync() {
+    if (syncQueued) return;
+    syncQueued = true;
+    setTimeout(() => {
+      syncQueued = false;
+      pollMulti();
+    }, 30);
+  }
+
   function boot() {
     cache = loadPlayersCache();
     ensureEncoded();
@@ -866,10 +1010,17 @@
     if (!document.querySelector('#friberg-helper')) createPanel();
     setStatus('就绪；若已有进行中的对局，请点「重新开始」让助手接管');
     ensureData().catch(e => setStatus('选手库加载失败：' + e.message));
+    // 事件驱动为主（新行/回合结束立即响应），快速轮询兜底
+    if (typeof MutationObserver === 'function') {
+      new MutationObserver(scheduleSync).observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+      });
+    }
     setInterval(() => {
       if (!document.querySelector('#friberg-helper')) createPanel();
       pollMulti();
-    }, 2000);
+    }, 500);
   }
 
   if (document.readyState === 'loading') {

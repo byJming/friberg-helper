@@ -7,7 +7,7 @@
 不是外挂，是你的猜手搭档 —— 帮你算最优猜测、替你打字，**提交与否由你决定**。
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version: 0.2.2](https://img.shields.io/badge/version-0.2.2-green.svg)
+![Version: 0.2.6](https://img.shields.io/badge/version-0.2.6-green.svg)
 ![Tampermonkey](https://img.shields.io/badge/userscript-Tampermonkey-orange.svg)
 
 </div>
@@ -49,7 +49,7 @@
 - 🌐 **多人联机自动接管** — 匹配/建房对局自动接管；DOM 轮询解析反馈（不依赖 WebSocket）；自动检测本局/整场结束、停止填充等待下一局；重赛（rematch）自动续接
 - ⚡ **可选自动提交**（多人）— 填入后自动点击提交，支持冷却重试与昵称一致性校验；默认关闭，一键开关
 - 📊 **经验积累** — 本地记录各难度下被猜中的选手，用于候选排序，越玩越懂你的对手
-- 📦 **选手库导入/同步** — 支持导入本地 `players_full.json`，或在线同步最新选手库；反馈数据自动回写修正本地属性
+- 📦 **选手库自动获取** — 默认从 GitHub 数据仓库（csgo-major-db）拉取选手数据；网络异常时回退本地导入 `players_full.json`；反馈数据自动回写修正本地属性
 - 🎛 **全功能可开关** — 自动填入、自动提交均可通过油猴菜单随时切换
 
 ## 安装
@@ -57,7 +57,12 @@
 1. 浏览器安装 [Tampermonkey](https://www.tampermonkey.net/)（或 Violentmonkey）；
 2. 点击安装脚本：[friberg-helper.user.js](https://github.com/byJming/friberg-helper/raw/main/friberg-helper.user.js)，油猴会弹出安装确认，点击安装；
 3. 刷新打开《弗一把》游戏页面，右下角出现「弗一把助手」面板即安装成功；
-4. **首次使用**：点面板「导入 JSON」，选择本仓库 `data/players_full.json`（646 名选手，随游戏官方数据更新）；或点「同步选手库」在线抓取最新数据（约 646 人，需几分钟）。
+4. **首次使用**：无需手动操作，助手默认自动从 GitHub 数据仓库（csgo-major-db）获取选手库；网络不可用时，点面板「导入 JSON」选择本仓库 `data/players_full.json`（646 名选手）作为回退。
+> ⚠️ **重要提示：跨源资源访问授权**
+>
+> 首次使用同步选手库时，油猴（Tampermonkey / Violentmonkey）会弹出「该脚本请求访问跨源资源」的确认框——这是因为脚本需要从 GitHub 的 csgo-major-db 数据仓库拉取选手数据，属于脚本的正常功能，请点击**「临时允许」（仅本次）或「始终允许」（推荐）**。
+>
+> 如果拒绝了授权，脚本将无法联网获取数据，**不影响其他功能**——点面板「导入 JSON」，选择本仓库自带的 `data/players_full.json` 即可离线使用。
 
 > 建议从本仓库获取最新版本（脚本内置更新地址，油猴会自动提示更新），警惕来路不明的改版脚本。
 
