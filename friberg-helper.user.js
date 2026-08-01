@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         弗一把助手
 // @namespace    shnlfriberg.helper
-// @version      0.3.0
+// @version      0.3.1
 // @description  弗一把(CSGO 选手猜测)开源辅助：求解最优猜测并填入输入框，单人与多人联机自动接管，提交与否由你决定
 // @match        https://shnlfriberg.online/*
 // @homepageURL  https://github.com/byJming/friberg-helper
@@ -273,6 +273,7 @@
     handicapRefIdx: -1,
     handicapPadSeq: null,
     handicapPadPos: 0,
+    handicapLastLv: null,
     roundMinGuesses: 0,
     awaitingRow: false,
     awaitingRowAt: 0,
@@ -284,29 +285,151 @@
   // ---------- 控场模式（多人） ----------
   // 目标：避免快速碾压导致对手没有体验。本局掷骰放水时直接跳过（判负），
   // 否则限制每局最少猜测次数、并延迟提交，拉长对局节奏。
-  // 探路采用「候选内渐进逼近」策略：
-  // - 每步都有正向 information gain（候选内选取，不触发断层检测）
-  // - 按与参照目标的距离从远到近分桶，反馈面板呈现逐步变绿的视觉效果
+  // 探路采用「属性支配渐进」策略：
+  // - attrLevels 精确复刻服务端 compareGuess 的三级着色（green/yellow/red）
+  // - 序列构建采用支配约束：已绿的列不允许回退，每步至少新增一列变绿
+  // - 同层候选中优先选信息量最大的（有效缩小候选集，避免平局）
   // - 始终排除最可能的答案，保证探路期间不会提前命中
 
-  // 计算选手 a 到选手 b 的属性距离（0 = 完全相同，越大越远）
+  // 计算选手 a 相对于选手 b 的逐属性反馈等级向量（精确复刻服务端着色）。
+  // 返回 8 元素数组，每元素 0=green, 1=yellow(close), 2=red(wrong)。
+  // 列顺序与 UI 一致：国籍, 地区, 队伍, 年龄, 位置, Major冠军, Major次数, 状态
+  function attrLevels(a, b) {
+    const lv = [];
+    // 国籍（nationalityAttr）
+    lv.push(enc.nats[a] === enc.nats[b] ? 0 : enc.regs[a] === enc.regs[b] ? 1 : 2);
+    // 地区（textAttr）
+    lv.push(enc.regs[a] === enc.regs[b] ? 0 : 2);
+    // 队伍（textAttr）
+    lv.push(enc.teams[a] === enc.teams[b] ? 0 : 2);
+    // 年龄（numberAttr, close=3）
+    const ageD = Math.abs(enc.ages[a] - enc.ages[b]);
+    lv.push(ageD === 0 ? 0 : ageD <= AGE_CLOSE ? 1 : 2);
+    // 位置（textAttr）
+    lv.push(enc.roles[a] === enc.roles[b] ? 0 : 2);
+    // Major 冠军（numberAttr, close=1）
+    const mcD = Math.abs(enc.mcs[a] - enc.mcs[b]);
+    lv.push(mcD === 0 ? 0 : mcD <= MAJOR_CLOSE ? 1 : 2);
+    // Major 次数（numberAttr, close=1）
+    const maD = Math.abs(enc.mas[a] - enc.mas[b]);
+    lv.push(maD === 0 ? 0 : maD <= MAJOR_CLOSE ? 1 : 2);
+    // 状态
+    lv.push(enc.acts[a] === enc.acts[b] ? 0 : 2);
+    return lv;
+  }
+
+  // 总非绿格子数（用于快速排序/fallback）
   function guessDistance(a, b) {
+    const lv = attrLevels(a, b);
     let d = 0;
-    if (enc.nats[a] !== enc.nats[b]) d += (enc.regs[a] === enc.regs[b] ? 1 : 2);
-    if (enc.regs[a] !== enc.regs[b]) d += 1;
-    if (enc.teams[a] !== enc.teams[b]) d += 1;
-    d += Math.min(Math.abs(enc.ages[a] - enc.ages[b]) / AGE_CLOSE, 3);
-    if (enc.roles[a] !== enc.roles[b]) d += 1;
-    d += Math.min(Math.abs(enc.mcs[a] - enc.mcs[b]), 3);
-    d += Math.min(Math.abs(enc.mas[a] - enc.mas[b]) * 0.5, 2);
-    // 活跃状态（权重 3：退役/现役差异会连带影响队伍+年龄+Major 多列反馈，视觉距离远大于单属性）
-    if (enc.acts[a] !== enc.acts[b]) d += 3;
+    for (let i = 0; i < lv.length; i++) d += lv[i];
     return d;
   }
 
-  // 控场探路：候选内渐进逼近 + 排除答案。
-  // 首次探路时生成固定序列（远 → 近），后续每步按序取用，
-  // 保证反馈严格从少绿到多绿过渡，不会因候选集缩小而重新排序导致反复。
+  // 计算猜测 g 对候选集的信息量（熵），确保探路有效缩小候选集
+  function guessInfoGain(g, cands) {
+    const n = cands.length;
+    if (n <= 1) return 0;
+    const counts = new Map();
+    for (const a of cands) {
+      const k = feedbackKey(enc, g, a);
+      counts.set(k, (counts.get(k) || 0) + 1);
+    }
+    let e = 0;
+    for (const c of counts.values()) {
+      const p = c / n;
+      e -= p * Math.log2(p);
+    }
+    return e;
+  }
+
+  // 构建「属性支配」渐进序列：
+  // 核心约束——后续猜测的每一列着色等级 ≥ 前一步（不允许已绿的列变红/黄），
+  // 且至少一列严格变好。这保证面板视觉上"只会越来越绿"。
+  // 在满足支配约束的候选中，优先选信息量最大的（有效缩小候选集，避免平局）。
+  // 当支配约束无法满足时（数据库中没有更优选手），渐进放宽：
+  //   tier1: 严格支配（无回退 + 有进步）
+  //   tier2: 无回退（所有列 ≥ 前一步，总距离相同）
+  //   tier3: 总距离更小（允许个别列微退，但整体更好）
+  //   tier4: 剩余中距离最小的
+  function buildPaddingSeq(pool, ref, cands) {
+    const n = pool.length;
+    if (n === 0) return [];
+    // 预计算每个候选的属性等级向量 + 信息量
+    const lvMap = new Map();
+    const infoMap = new Map();
+    for (const c of pool) {
+      lvMap.set(c, attrLevels(c, ref));
+      infoMap.set(c, guessInfoGain(c, cands));
+    }
+    const totalLv = lv => lv.reduce((s, v) => s + v, 0);
+    const greenCount = lv => lv.filter(v => v === 0).length;
+
+    const seq = [];
+    const used = new Set();
+    // 起点：选绿色最少（总距离最大）的候选，信息量作 tiebreak
+    let start = pool[0];
+    for (const c of pool) {
+      const tc = totalLv(lvMap.get(c)), ts = totalLv(lvMap.get(start));
+      if (tc > ts || (tc === ts && infoMap.get(c) > infoMap.get(start))) start = c;
+    }
+    seq.push(start);
+    used.add(start);
+
+    while (used.size < n) {
+      const curLv = lvMap.get(seq[seq.length - 1]);
+      // tier1: 严格支配——每列 ≤ cur（不退步），且至少一列 < cur（进步）
+      let tier = [];
+      for (const c of pool) {
+        if (used.has(c)) continue;
+        const lv = lvMap.get(c);
+        let dominated = true, improved = false;
+        for (let i = 0; i < 8; i++) {
+          if (lv[i] > curLv[i]) { dominated = false; break; }
+          if (lv[i] < curLv[i]) improved = true;
+        }
+        if (dominated && improved) tier.push(c);
+      }
+      // tier2: 无回退（所有列 ≤ cur），总距离相同（没有进步但也不退）
+      if (!tier.length) {
+        for (const c of pool) {
+          if (used.has(c)) continue;
+          const lv = lvMap.get(c);
+          let dominated = true;
+          for (let i = 0; i < 8; i++) { if (lv[i] > curLv[i]) { dominated = false; break; } }
+          if (dominated) tier.push(c);
+        }
+      }
+      // tier3: 总距离更小（允许个别列微退，但整体更好）
+      if (!tier.length) {
+        const curTotal = totalLv(curLv);
+        for (const c of pool) {
+          if (used.has(c)) continue;
+          if (totalLv(lvMap.get(c)) < curTotal) tier.push(c);
+        }
+      }
+      // tier4: 剩余全部，按距离升序
+      if (!tier.length) {
+        for (const c of pool) { if (!used.has(c)) tier.push(c); }
+        tier.sort((a, b) => totalLv(lvMap.get(a)) - totalLv(lvMap.get(b)));
+      }
+      // 从当前 tier 中选信息量最大的（同信息量选绿色多的）
+      let best = tier[0];
+      for (const c of tier) {
+        const ic = infoMap.get(c), ib = infoMap.get(best);
+        if (ic > ib || (ic === ib && greenCount(lvMap.get(c)) > greenCount(lvMap.get(best)))) best = c;
+      }
+      seq.push(best);
+      used.add(best);
+    }
+    return seq;
+  }
+
+  // 控场探路：属性支配渐进 + 排除答案 + 信息量最大化。
+  // 首次探路时通过 buildPaddingSeq 生成固定序列，后续每步按序取用。
+  // 保证：① 面板每行严格比上一行更绿（已绿列不退步）
+  //       ② 同层候选中优先选信息量最大的（有效排除候选人，避免平局）
+  //       ③ 参照目标（最可能是答案）始终排除，探路期间绝不命中
   function pickPaddingGuess(cands, excluded, paddingLeft) {
     const available = cands.filter(c => !excluded.has(c));
     if (available.length === 0) return -1;
@@ -322,14 +445,11 @@
       const outside = all.filter(c => !candsSet.has(c) && !excluded.has(c));
       return outside.length > 0 ? outside[Math.floor(Math.random() * outside.length)] : -1;
     }
-    // 首次探路：生成固定序列（整局不变）
+    // 首次探路：生成属性支配渐进序列（整局不变）
     if (!multi.handicapPadSeq) {
       const ref = multi.handicapRefIdx;
-      // 排除参照目标，按距离从远到近排序（远 = 少绿，近 = 多绿）
       const pool = available.filter(c => c !== ref);
-      multi.handicapPadSeq = pool.slice().sort(
-        (a, b) => guessDistance(b, ref) - guessDistance(a, ref) // 降序：远在前
-      );
+      multi.handicapPadSeq = buildPaddingSeq(pool, ref, cands);
       multi.handicapPadPos = 0;
     }
     // 从固定序列中按序取用（跳过已猜过的）
@@ -533,6 +653,7 @@
     multi.handicapRefIdx = -1;
     multi.handicapPadSeq = null;
     multi.handicapPadPos = 0;
+    multi.handicapLastLv = null;
     rollHandicapLose();
   }
 
@@ -905,10 +1026,9 @@
       setStatus('多人：本局已无未提交选手');
       return;
     }
-    // 控场：每局最少猜测次数——候选内渐进探路。
-    // 核心约束：探路期间绝不提交答案，即使 pickPaddingGuess 失败也必须强制找一个非答案选手。
     const h = handicapConfig();
     const remaining = 8 - multi.turn;
+    // 控场探路阶段：最少猜测次数内使用 padding 序列（绝不命中答案）
     if (h.enabled && multi.turn < multi.roundMinGuesses && remaining > 2) {
       const guessedAll = new Set([...multi.guessed, ...multi.submitted, ...(multi.pendingIdx >= 0 ? [multi.pendingIdx] : [])]);
       const paddingLeft = multi.roundMinGuesses - multi.turn;
@@ -916,11 +1036,54 @@
       if (pg >= 0) {
         g = pg;
       } else {
-        // 兆底：全库中找一个未猜过且非参照目标的选手，绝不回退到 pickGuess 的结果（可能是答案）
         const ref = multi.handicapRefIdx;
         const fallback = all.find(c => !guessedAll.has(c) && c !== ref);
         if (fallback !== undefined) g = fallback;
       }
+    } else if (h.enabled && multi.handicapRefIdx >= 0 && multi.handicapLastLv) {
+      // 控场求解阶段：padding 结束后，solver 的候选也受支配约束，
+      // 保证整局所有行的着色严格渐进（已绿列不退步）。
+      const ref = multi.handicapRefIdx;
+      const curLv = multi.handicapLastLv;
+      const pool = (available.length ? available : all.filter(c => !excluded.has(c)))
+        .filter(c => c !== ref);
+      // tier1: 严格支配（无回退 + 有进步）
+      let dominated = pool.filter(c => {
+        const lv = attrLevels(c, ref);
+        let dom = true, imp = false;
+        for (let i = 0; i < 8; i++) {
+          if (lv[i] > curLv[i]) { dom = false; break; }
+          if (lv[i] < curLv[i]) imp = true;
+        }
+        return dom && imp;
+      });
+      // tier2: 无回退（允许持平）
+      if (!dominated.length) {
+        dominated = pool.filter(c => {
+          const lv = attrLevels(c, ref);
+          for (let i = 0; i < 8; i++) { if (lv[i] > curLv[i]) return false; }
+          return true;
+        });
+      }
+      // tier3: 总距离更小
+      if (!dominated.length) {
+        const curTotal = curLv.reduce((s, v) => s + v, 0);
+        dominated = pool.filter(c => guessDistance(c, ref) < curTotal);
+      }
+      if (dominated.length) {
+        // 从支配候选中选信息量最大的
+        let best = dominated[0], bestInfo = guessInfoGain(best, cands);
+        for (let i = 1; i < dominated.length; i++) {
+          const info = guessInfoGain(dominated[i], cands);
+          if (info > bestInfo) { best = dominated[i]; bestInfo = info; }
+        }
+        g = best;
+      }
+      // tier4: 无支配候选时保持 solver 原始选择
+    }
+    // 更新渐进基线：记录本次猜测相对于参照目标的属性等级
+    if (h.enabled && multi.handicapRefIdx >= 0 && g >= 0 && g !== multi.handicapRefIdx) {
+      multi.handicapLastLv = attrLevels(g, multi.handicapRefIdx);
     }
     multi.lastIdx = g;
     renderPanel({ mode: multi.mode, cands: cands.length, total: enc.n, turn: multi.turn, max: 8, nick: enc.nicks[g], exp: 0, statusLine });
