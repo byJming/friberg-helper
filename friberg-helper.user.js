@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         弗一把助手
 // @namespace    shnlfriberg.helper
-// @version      0.9.0
+// @version      0.9.1
 // @description  弗一把(CSGO 选手猜测)开源辅助：求解最优猜测并填入输入框，单人与多人联机自动接管，提交与否由你决定；首次自动拉取仓库数据，支持本地 JSON 导入与服务器增量同步
 // @match        https://shnlfriberg.online/*
 // @homepageURL  https://github.com/byJming/friberg-helper
@@ -1092,6 +1092,48 @@
     }
   }
 
+  // ---------- 缺失选手自动补充 ----------
+  // 对局结束发现「答案不在本地库 / 不在候选集」时，自动从服务器拉取该选手完整属性，
+  // 以服务器优先级（最高）合并进选手库并重建编码，立即生效；失败时退回手动导入提示。
+  // 仅拉 1 名选手，与「同步服务器」共用 /api/players 限流额度（10 次/60s），并受滑动窗口约束。
+  let _autoFixSeen = new Set();            // 会话内已尝试过的昵称（成功/失败均记录，防反复请求）
+  let _autoFixRunning = false;             // 防重入（同时只允许一个自动补充请求在途）
+  const _autoFixWindow = { count: 0, at: 0 }; // 滑动窗口：60s 内最多 PLAYER_SEARCH_RATE_LIMIT 次
+
+  function autoFixMissingPlayer(nickname) {
+    if (!nickname || !cache || !cache.players || !cache.players.length) return false;
+    if (_autoFixRunning || (_syncState && _syncState.running)) return false; // 手动同步进行中不并发
+    if (_autoFixSeen.has(nickname)) return false;
+    const now = Date.now();
+    if (now - _autoFixWindow.at >= PLAYER_SEARCH_WINDOW_MS) { _autoFixWindow.count = 0; _autoFixWindow.at = now; }
+    if (_autoFixWindow.count >= PLAYER_SEARCH_RATE_LIMIT) {
+      setStatus(`选手库与服务器不一致（答案「${nickname}」），服务器限流中，请稍后点「同步服务器」`);
+      return false;
+    }
+    _autoFixSeen.add(nickname);
+    _autoFixRunning = true;
+    _autoFixWindow.count++;
+    setStatus(`检测到服务器选手「${nickname}」缺失，正在自动从服务器补充…`);
+    fetchServerPlayerAttr(nickname, null)
+      .then(r => {
+        // 严格校验：仅接受精确昵称匹配，避免 /api/players 模糊搜索返回他人数据
+        if (r && !r.rateLimited && r.nickname === nickname) {
+          const res = mergeIntoCacheLight([r], null);
+          applyMergedData();
+          setStatus(`已自动补充服务器选手「${nickname}」（库共 ${res.total} 人，属性以服务器为准）`);
+        } else if (r && r.rateLimited) {
+          setStatus(`选手库与服务器不一致（答案「${nickname}」）：服务器限流中，请稍后点「同步服务器」`);
+        } else {
+          setStatus(`选手库与服务器不一致（答案「${nickname}」）：服务器未返回该选手数据，请点「导入 JSON」重新导入与服务器一致的选手库`);
+        }
+      })
+      .catch(e => {
+        setStatus(`自动补充「${nickname}」失败：` + (e && e.message ? e.message : e) + '，请点「同步服务器」或「导入 JSON」');
+      })
+      .finally(() => { _autoFixRunning = false; });
+    return true;
+  }
+
   // ---------- 仓库自动拉取（首次运行 / 手动重试） ----------
   // 用 GM_xmlhttpRequest 跨源拉取 raw.githubusercontent.com（已 @connect 声明）。
   // 仓库数据为最低优先级：仅填充本地没有的选手，不覆盖服务器/导入数据。
@@ -1262,9 +1304,9 @@
     if (fb.attributes && fb.nickname) {
       const list = cache ? cache.players : null;
       if (list) {
+        const a = fb.attributes;
         const p = list.find(x => x.nickname === fb.nickname);
         if (p) {
-          const a = fb.attributes;
           p.nationality = a.nationality.value;
           p.region = a.region.value;
           p.team = a.team.value;
@@ -1274,6 +1316,26 @@
           p.majorAppearances = a.majorAppearances.value;
           p.isActive = a.isActive.value;
           savePlayersCache(cache);
+        } else {
+          // 服务器反馈的权威属性直接补入库（server 优先级，数据现成零请求）。
+          // 不重建 enc / 不打断当前对局，下次对局 startGame 时 ensureEncoded 自动生效。
+          normalizeCache();
+          cache.players.push({
+            id: (data && data.answer && typeof data.answer.id === 'number') ? data.answer.id : null,
+            nickname: fb.nickname,
+            nationality: a.nationality.value,
+            region: a.region.value,
+            team: a.team.value,
+            age: a.age.value,
+            role: a.role.value,
+            majorChampionships: a.majorChampionships.value,
+            majorAppearances: a.majorAppearances.value,
+            isActive: a.isActive.value,
+          });
+          cache.sourceMap[fb.nickname] = 'server';
+          cache.sources = Object.assign({}, cache.sources || {}, { server: true });
+          savePlayersCache(cache);
+          setStatus(`已自动补充服务器选手「${fb.nickname}」（下次对局生效）`);
         }
       }
     }
@@ -1675,8 +1737,8 @@
         setStatus(`多人${won ? '获胜' : '失利'}：答案 ${multi.lastAnswer}（已记录）`);
         if (enc) {
           const ansIdx = enc.nicks.indexOf(multi.lastAnswer);
-          if (ansIdx >= 0 && !multi.candidates.includes(ansIdx)) {
-            setStatus(`选手库与服务器不一致（答案「${multi.lastAnswer}」不在候选集），请点「导入 JSON」重新导入与服务器一致的选手库`);
+          if (ansIdx < 0 || (ansIdx >= 0 && !multi.candidates.includes(ansIdx))) {
+            autoFixMissingPlayer(multi.lastAnswer);
           }
         }
       } else if (!multi.ended) {
@@ -1704,8 +1766,8 @@
         // 数据一致性校验：答案不在本地候选集中说明选手库已过期，反馈过滤会持续错位
         if (enc) {
           const ansIdx = enc.nicks.indexOf(multi.lastAnswer);
-          if (ansIdx >= 0 && !multi.candidates.includes(ansIdx)) {
-            setStatus(`选手库与服务器不一致（答案「${multi.lastAnswer}」不在候选集），请点「导入 JSON」重新导入与服务器一致的选手库`);
+          if (ansIdx < 0 || (ansIdx >= 0 && !multi.candidates.includes(ansIdx))) {
+            autoFixMissingPlayer(multi.lastAnswer);
           }
         }
       }

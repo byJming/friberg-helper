@@ -5,7 +5,7 @@
 **CS:GO/CS2 选手猜测游戏辅助油猴脚本 — 求解、填入、控场、反检测**
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version: 0.9.0](https://img.shields.io/badge/version-0.9.0-green.svg)
+![Version: 0.9.1](https://img.shields.io/badge/version-0.9.1-green.svg)
 ![Tampermonkey](https://img.shields.io/badge/userscript-Tampermonkey-orange.svg)
 
 </div>
@@ -22,7 +22,7 @@
 
 **反检测 governor** — 跨局滚动平均 entropyPercentile，动态调整目标百分位带，把服务端 similarityIndex 压在 common 区间，模拟"聪明但非机器"的玩家
 
-**三级数据源** — 仓库自动拉取 < 本地 JSON 导入 < 服务器增量同步；任何来源增量合并不清空既有数据，冲突以高优先级为准
+**三级数据源** — 仓库自动拉取 < 本地 JSON 导入 < 服务器增量同步；任何来源增量合并不清空既有数据，冲突以高优先级为准。检测到答案与本地选手库不一致时，自动从服务器补充缺失选手（服务器数据，优先级最高）
 
 **自动提交** — 可选；冷却等待 + 昵称校验 + 去重，默认关闭
 
