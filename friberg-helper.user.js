@@ -1,19 +1,19 @@
 // ==UserScript==
 // @name         弗一把助手
 // @namespace    shnlfriberg.helper
-// @version      0.3.1
-// @description  弗一把(CSGO 选手猜测)开源辅助：求解最优猜测并填入输入框，单人与多人联机自动接管，提交与否由你决定
+// @version      0.9.0
+// @description  弗一把(CSGO 选手猜测)开源辅助：求解最优猜测并填入输入框，单人与多人联机自动接管，提交与否由你决定；首次自动拉取仓库数据，支持本地 JSON 导入与服务器增量同步
 // @match        https://shnlfriberg.online/*
 // @homepageURL  https://github.com/byJming/friberg-helper
 // @supportURL   https://github.com/byJming/friberg-helper/issues
 // @downloadURL  https://github.com/byJming/friberg-helper/raw/main/friberg-helper.user.js
 // @run-at       document-start
-// @connect      raw.githubusercontent.com
-// @connect      api.github.com
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
+// @connect      raw.githubusercontent.com
+// @connect      github.com
 // @license      MIT
 // ==/UserScript==
 
@@ -24,6 +24,13 @@
   const KEY_PLAYERS = 'friberg.players.v1';
   const KEY_STATS = 'friberg.stats.v1';
   const KEY_SETTINGS = 'friberg.settings.v1';
+  const KEY_SERVERSYNC = 'friberg.serversync.v1'; // 服务器同步进度：{version, synced:{nick:true}}
+
+  // 数据来源优先级：服务器 > 用户导入 > 仓库自动拉取。冲突时高优先级覆盖低优先级；
+  // 任何来源都不会清空既有数据（增量合并，不冲突互相补充）。
+  const SOURCE_PRIO = { repo: 1, import: 2, server: 3 };
+  // 仓库原始数据（snake_case，无 id）。首次运行无本地数据时自动拉取，作为初始选手库。
+  const REPO_DATA_URL = 'https://raw.githubusercontent.com/byJming/friberg-helper/main/data/players_full.json';
 
   const AGE_CLOSE = 3;
   const MAJOR_CLOSE = 1;
@@ -79,6 +86,15 @@
     _settingsCache = s;
     try { GM_setValue(KEY_SETTINGS, s); } catch (e) { /* quota */ }
   }
+  // 服务器同步进度：{ version, synced:{<nickname>:true} }
+  // synced 记录「在 version 这个服务器版本下已确认过的昵称」——含成功拉取与服务器确认不存在。
+  // 版本变更时整体清空（新版本所有选手都需重新以服务器为准），保证「冲突以服务器为准」始终生效。
+  function loadServerSync() {
+    try { return GM_getValue(KEY_SERVERSYNC, null) || { version: null, synced: {} }; } catch (e) { return { version: null, synced: {} }; }
+  }
+  function saveServerSync(s) {
+    try { GM_setValue(KEY_SERVERSYNC, s); } catch (e) { /* quota */ }
+  }
 
   // ---------- 求解器（移植自 scripts/solver.js） ----------
   function encodePlayers(players) {
@@ -113,48 +129,48 @@
     return enc;
   }
 
+  // 5 级数值反馈：0=相等 1=close且目标更大 2=far且目标更大 3=close且目标更小 4=far且目标更小。
+  // 与服务端 numberFeedbackCode 逐字等价 —— 修复 v0.4.0 close 方向 hint 未利用的 bug：
+  // 旧版把 close 合并为一级，丢失"目标更大/更小"信息，导致候选集膨胀、内部增益计算与服务端失配。
+  function numLevel(gv, tv, closeRange) {
+    if (gv === tv) return 0;
+    const close = Math.abs(gv - tv) <= closeRange;
+    return tv > gv ? (close ? 1 : 2) : (close ? 3 : 4);
+  }
+  // 逐属性反馈分区键 —— 与服务端 feedbackSignature 逐字等价：
+  // ① id 隔离位（猜测即答案时单独成区，匹配服务端最优增益基准）；
+  // ② 国籍 3 级折叠地区（同国/异国同区/异国异区），多人面板无独立地区列亦能正确分区；
+  // ③ 数值 5 级含方向。分区等价 ⇒ 内部信息增益/百分位计算与服务端一致，governor 可真实控场。
   function feedbackKey(enc, g, a) {
-    let k = 0;
-    let nat;
-    if (enc.nats[g] === enc.nats[a]) nat = 0;
-    else if (enc.regs[g] === enc.regs[a]) nat = 1;
-    else nat = 2;
+    let k = g === a ? 1 : 0; // id 隔离位
+    const nat = enc.nats[g] === enc.nats[a] ? 2 : enc.regs[g] === enc.regs[a] ? 1 : 0;
     k = k * 3 + nat;
-    k = k * 3 + (enc.regs[g] === enc.regs[a] ? 0 : 2);
-    k = k * 3 + (enc.teams[g] === enc.teams[a] ? 0 : 2);
-    let ageS;
-    if (enc.ages[g] === enc.ages[a]) ageS = 0;
-    else if (Math.abs(enc.ages[g] - enc.ages[a]) <= AGE_CLOSE) ageS = 1;
-    else ageS = enc.ages[a] > enc.ages[g] ? 2 : 3;
-    k = k * 4 + ageS;
-    k = k * 3 + (enc.roles[g] === enc.roles[a] ? 0 : 2);
-    let mcS;
-    if (enc.mcs[g] === enc.mcs[a]) mcS = 0;
-    else if (Math.abs(enc.mcs[g] - enc.mcs[a]) <= MAJOR_CLOSE) mcS = 1;
-    else mcS = enc.mcs[a] > enc.mcs[g] ? 2 : 3;
-    k = k * 4 + mcS;
-    let maS;
-    if (enc.mas[g] === enc.mas[a]) maS = 0;
-    else if (Math.abs(enc.mas[g] - enc.mas[a]) <= MAJOR_CLOSE) maS = 1;
-    else maS = enc.mas[a] > enc.mas[g] ? 2 : 3;
-    k = k * 4 + maS;
-    k = k * 3 + (enc.acts[g] === enc.acts[a] ? 0 : 2);
+    k = k * 2 + (enc.teams[g] === enc.teams[a] ? 1 : 0);
+    k = k * 5 + numLevel(enc.ages[g], enc.ages[a], AGE_CLOSE);
+    k = k * 2 + (enc.roles[g] === enc.roles[a] ? 1 : 0);
+    k = k * 5 + numLevel(enc.mcs[g], enc.mcs[a], MAJOR_CLOSE);
+    k = k * 5 + numLevel(enc.mas[g], enc.mas[a], MAJOR_CLOSE);
+    k = k * 2 + (enc.acts[g] === enc.acts[a] ? 1 : 0);
     return k;
   }
 
   const LEVEL_CODE = { correct: 0, close: 1, wrong: 2 };
+  // 从服务端反馈属性构造分区键（单人对局）。仅在未猜中（game 继续）时调用，id 隔离位恒 0。
+  function numLevelFromAttr(f) {
+    if (f.level === 'correct') return 0;
+    const close = f.level === 'close';
+    return f.hint === 'higher' ? (close ? 1 : 2) : (close ? 3 : 4);
+  }
   function feedbackKeyFromServer(attrs) {
-    const lv = f => LEVEL_CODE[f.level];
-    const num = f => (f.level === 'correct' ? 0 : f.level === 'close' ? 1 : f.hint === 'higher' ? 2 : 3);
-    let k = 0;
-    k = k * 3 + lv(attrs.nationality);
-    k = k * 3 + lv(attrs.region);
-    k = k * 3 + lv(attrs.team);
-    k = k * 4 + num(attrs.age);
-    k = k * 3 + lv(attrs.role);
-    k = k * 4 + num(attrs.majorChampionships);
-    k = k * 4 + num(attrs.majorAppearances);
-    k = k * 3 + lv(attrs.isActive);
+    let k = 0; // id 隔离位：未猜中时恒 0
+    const nat = attrs.nationality.level === 'correct' ? 2 : attrs.nationality.level === 'close' ? 1 : 0;
+    k = k * 3 + nat; // 地区信息已折叠进国籍 3 级，无需单独编码 region
+    k = k * 2 + (attrs.team.level === 'correct' ? 1 : 0);
+    k = k * 5 + numLevelFromAttr(attrs.age);
+    k = k * 2 + (attrs.role.level === 'correct' ? 1 : 0);
+    k = k * 5 + numLevelFromAttr(attrs.majorChampionships);
+    k = k * 5 + numLevelFromAttr(attrs.majorAppearances);
+    k = k * 2 + (attrs.isActive.level === 'correct' ? 1 : 0);
     return k;
   }
 
@@ -270,10 +286,8 @@
     ended: false,
     handicapLose: false,
     handicapSkipDone: false,
-    handicapRefIdx: -1,
-    handicapPadSeq: null,
-    handicapPadPos: 0,
-    handicapLastLv: null,
+    handicapPlan: null,
+    bestGreens: 0,
     roundMinGuesses: 0,
     awaitingRow: false,
     awaitingRowAt: 0,
@@ -282,43 +296,31 @@
     autoSubmit: { pending: false, attempted: false, expected: '', lastClick: 0, nextAttemptAt: 0, delayUntil: 0 },
   };
 
-  // ---------- 控场模式（多人） ----------
-  // 目标：避免快速碾压导致对手没有体验。本局掷骰放水时直接跳过（判负），
-  // 否则限制每局最少猜测次数、并延迟提交，拉长对局节奏。
-  // 探路采用「属性支配渐进」策略：
-  // - attrLevels 精确复刻服务端 compareGuess 的三级着色（green/yellow/red）
-  // - 序列构建采用支配约束：已绿的列不允许回退，每步至少新增一列变绿
-  // - 同层候选中优先选信息量最大的（有效缩小候选集，避免平局）
-  // - 始终排除最可能的答案，保证探路期间不会提前命中
+  // === CORE-BEGIN ===
+  // 纯决策核心（无 DOM/GM 依赖）。computeMultiFill 与仿真测试共用此区段。
+  // 控场目标：像真人一样逐步逼近答案——开局猜知名选手、中段按反馈收敛、
+  // 确认答案后在到达最小猜测次数前用「近似答案」递补（绝不提前提交）。
+  // 反检测：以服务端 entropyPercentile 为目标的带内采样，避免持续 top-1。
 
   // 计算选手 a 相对于选手 b 的逐属性反馈等级向量（精确复刻服务端着色）。
   // 返回 8 元素数组，每元素 0=green, 1=yellow(close), 2=red(wrong)。
   // 列顺序与 UI 一致：国籍, 地区, 队伍, 年龄, 位置, Major冠军, Major次数, 状态
   function attrLevels(a, b) {
     const lv = [];
-    // 国籍（nationalityAttr）
     lv.push(enc.nats[a] === enc.nats[b] ? 0 : enc.regs[a] === enc.regs[b] ? 1 : 2);
-    // 地区（textAttr）
     lv.push(enc.regs[a] === enc.regs[b] ? 0 : 2);
-    // 队伍（textAttr）
     lv.push(enc.teams[a] === enc.teams[b] ? 0 : 2);
-    // 年龄（numberAttr, close=3）
     const ageD = Math.abs(enc.ages[a] - enc.ages[b]);
     lv.push(ageD === 0 ? 0 : ageD <= AGE_CLOSE ? 1 : 2);
-    // 位置（textAttr）
     lv.push(enc.roles[a] === enc.roles[b] ? 0 : 2);
-    // Major 冠军（numberAttr, close=1）
     const mcD = Math.abs(enc.mcs[a] - enc.mcs[b]);
     lv.push(mcD === 0 ? 0 : mcD <= MAJOR_CLOSE ? 1 : 2);
-    // Major 次数（numberAttr, close=1）
     const maD = Math.abs(enc.mas[a] - enc.mas[b]);
     lv.push(maD === 0 ? 0 : maD <= MAJOR_CLOSE ? 1 : 2);
-    // 状态
     lv.push(enc.acts[a] === enc.acts[b] ? 0 : 2);
     return lv;
   }
 
-  // 总非绿格子数（用于快速排序/fallback）
   function guessDistance(a, b) {
     const lv = attrLevels(a, b);
     let d = 0;
@@ -326,7 +328,6 @@
     return d;
   }
 
-  // 计算猜测 g 对候选集的信息量（熵），确保探路有效缩小候选集
   function guessInfoGain(g, cands) {
     const n = cands.length;
     if (n <= 1) return 0;
@@ -343,128 +344,288 @@
     return e;
   }
 
-  // 构建「属性支配」渐进序列：
-  // 核心约束——后续猜测的每一列着色等级 ≥ 前一步（不允许已绿的列变红/黄），
-  // 且至少一列严格变好。这保证面板视觉上"只会越来越绿"。
-  // 在满足支配约束的候选中，优先选信息量最大的（有效缩小候选集，避免平局）。
-  // 当支配约束无法满足时（数据库中没有更优选手），渐进放宽：
-  //   tier1: 严格支配（无回退 + 有进步）
-  //   tier2: 无回退（所有列 ≥ 前一步，总距离相同）
-  //   tier3: 总距离更小（允许个别列微退，但整体更好）
-  //   tier4: 剩余中距离最小的
-  function buildPaddingSeq(pool, ref, cands) {
-    const n = pool.length;
-    if (n === 0) return [];
-    // 预计算每个候选的属性等级向量 + 信息量
-    const lvMap = new Map();
-    const infoMap = new Map();
-    for (const c of pool) {
-      lvMap.set(c, attrLevels(c, ref));
-      infoMap.set(c, guessInfoGain(c, cands));
-    }
-    const totalLv = lv => lv.reduce((s, v) => s + v, 0);
-    const greenCount = lv => lv.filter(v => v === 0).length;
-
-    const seq = [];
-    const used = new Set();
-    // 起点：选绿色最少（总距离最大）的候选，信息量作 tiebreak
-    let start = pool[0];
-    for (const c of pool) {
-      const tc = totalLv(lvMap.get(c)), ts = totalLv(lvMap.get(start));
-      if (tc > ts || (tc === ts && infoMap.get(c) > infoMap.get(start))) start = c;
-    }
-    seq.push(start);
-    used.add(start);
-
-    while (used.size < n) {
-      const curLv = lvMap.get(seq[seq.length - 1]);
-      // tier1: 严格支配——每列 ≤ cur（不退步），且至少一列 < cur（进步）
-      let tier = [];
-      for (const c of pool) {
-        if (used.has(c)) continue;
-        const lv = lvMap.get(c);
-        let dominated = true, improved = false;
-        for (let i = 0; i < 8; i++) {
-          if (lv[i] > curLv[i]) { dominated = false; break; }
-          if (lv[i] < curLv[i]) improved = true;
-        }
-        if (dominated && improved) tier.push(c);
-      }
-      // tier2: 无回退（所有列 ≤ cur），总距离相同（没有进步但也不退）
-      if (!tier.length) {
-        for (const c of pool) {
-          if (used.has(c)) continue;
-          const lv = lvMap.get(c);
-          let dominated = true;
-          for (let i = 0; i < 8; i++) { if (lv[i] > curLv[i]) { dominated = false; break; } }
-          if (dominated) tier.push(c);
-        }
-      }
-      // tier3: 总距离更小（允许个别列微退，但整体更好）
-      if (!tier.length) {
-        const curTotal = totalLv(curLv);
-        for (const c of pool) {
-          if (used.has(c)) continue;
-          if (totalLv(lvMap.get(c)) < curTotal) tier.push(c);
-        }
-      }
-      // tier4: 剩余全部，按距离升序
-      if (!tier.length) {
-        for (const c of pool) { if (!used.has(c)) tier.push(c); }
-        tier.sort((a, b) => totalLv(lvMap.get(a)) - totalLv(lvMap.get(b)));
-      }
-      // 从当前 tier 中选信息量最大的（同信息量选绿色多的）
-      let best = tier[0];
-      for (const c of tier) {
-        const ic = infoMap.get(c), ib = infoMap.get(best);
-        if (ic > ib || (ic === ib && greenCount(lvMap.get(c)) > greenCount(lvMap.get(best)))) best = c;
-      }
-      seq.push(best);
-      used.add(best);
-    }
-    return seq;
+  // 流行度代理：Major 出场/冠军 + 在役，越高的选手越像真人会猜的「知名选手」。
+  function playerPopularity(i) {
+    const p = cache && cache.players ? cache.players[i] : null;
+    if (!p) return 1;
+    return (p.majorAppearances || 0) + (p.majorChampionships || 0) * 4 + (p.isActive ? 2 : 0) + 1;
   }
 
-  // 控场探路：属性支配渐进 + 排除答案 + 信息量最大化。
-  // 首次探路时通过 buildPaddingSeq 生成固定序列，后续每步按序取用。
-  // 保证：① 面板每行严格比上一行更绿（已绿列不退步）
-  //       ② 同层候选中优先选信息量最大的（有效排除候选人，避免平局）
-  //       ③ 参照目标（最可能是答案）始终排除，探路期间绝不命中
-  function pickPaddingGuess(cands, excluded, paddingLeft) {
-    const available = cands.filter(c => !excluded.has(c));
-    if (available.length === 0) return -1;
-    // 尽早确定参照目标（最可能是答案），供 fallback 使用
-    if (multi.handicapRefIdx < 0 || !cands.includes(multi.handicapRefIdx)) {
-      multi.handicapRefIdx = available.slice().sort(
-        (a, b) => guessExperience(enc.nicks[b]) - guessExperience(enc.nicks[a])
-      )[0];
-    }
-    // 候选仅剩 1 人：它就是答案，从候选外选一个必不命中的
-    if (available.length === 1) {
-      const candsSet = new Set(cands);
-      const outside = all.filter(c => !candsSet.has(c) && !excluded.has(c));
-      return outside.length > 0 ? outside[Math.floor(Math.random() * outside.length)] : -1;
-    }
-    // 首次探路：生成属性支配渐进序列（整局不变）
-    if (!multi.handicapPadSeq) {
-      const ref = multi.handicapRefIdx;
-      const pool = available.filter(c => c !== ref);
-      multi.handicapPadSeq = buildPaddingSeq(pool, ref, cands);
-      multi.handicapPadPos = 0;
-    }
-    // 从固定序列中按序取用（跳过已猜过的）
-    const seq = multi.handicapPadSeq;
-    while (multi.handicapPadPos < seq.length && excluded.has(seq[multi.handicapPadPos])) {
-      multi.handicapPadPos++;
-    }
-    if (multi.handicapPadPos < seq.length) {
-      return seq[multi.handicapPadPos++];
-    }
-    // 序列耗尽：回退到候选外
-    const candsSet = new Set(cands);
-    const outside = all.filter(c => !candsSet.has(c) && !excluded.has(c));
-    return outside.length > 0 ? outside[Math.floor(Math.random() * outside.length)] : -1;
+  // 最可能是答案的候选（历史经验 + 流行度），用于控场禁胜窗口排除
+  function modalCandidate(cands, guessed) {
+    const avail = cands.filter(c => !guessed.has(c));
+    if (!avail.length) return -1;
+    avail.sort((a, b) =>
+      (guessExperience(enc.nicks[b]) + playerPopularity(b) * 0.1) -
+      (guessExperience(enc.nicks[a]) + playerPopularity(a) * 0.1));
+    return avail[0];
   }
+
+  // 反检测 governor：跨局滚动平均 entropyPercentile，动态调整目标带，
+  // 把服务端 similarityIndex 压在 common 区间。
+  const _gov = { recent: [] };
+  function resetGovernor() { _gov.recent.length = 0; }
+  function targetBand() {
+    const arr = _gov.recent;
+    if (arr.length < 4) return { lo: 0.35, hi: 0.85 };
+    let mean = 0; for (const v of arr) mean += v; mean /= arr.length;
+    // 动态收紧：均值偏高时压低上界，均值偏低时抬高下界
+    if (mean > 0.78) return { lo: 0.2, hi: 0.48 };
+    if (mean < 0.45) return { lo: 0.62, hi: 0.92 };
+    if (mean > 0.68) return { lo: 0.28, hi: 0.62 };
+    return { lo: 0.35, hi: 0.8 };
+  }
+  function recordPercentile(p) { _gov.recent.push(p); if (_gov.recent.length > 40) _gov.recent.shift(); }
+
+  // 自然逼近采样：在目标百分位带内，按「流行度 + 信息增益」混合打分，
+  // 从 top-K 加权随机选取。开局流行度权重高（猜知名选手），后期逻辑权重高。
+  // outsideOnly=true 时只从候选集外选（保证绝不命中答案，用于小候选禁胜窗口）。
+  function pickNaturalGuess(o) {
+    const { cands, excluded, turn, outsideOnly, modalAns } = o;
+    const bestGreens = o.bestGreens || 0;
+    const remaining = o.remaining != null ? o.remaining : 99;
+    let selPool = all.filter(c => !excluded.has(c) && c !== modalAns &&
+      (outsideOnly ? !cands.includes(c) : true));
+    // 候选集覆盖了所有未猜选手（典型如开局 cands=all）：没有「候选集外」可选，
+    // 退化为候选集内自然猜测（排除最可能答案以降低提前命中概率）。
+    let effOutside = outsideOnly;
+    let effModal = modalAns;
+    if (effOutside && !selPool.length) {
+      effOutside = false;
+      if (effModal < 0) effModal = modalCandidate(cands, excluded);
+      // 禁胜窗口回退（典型如开局 cands=all 无「候选集外」可选）：
+      // 排除最热门的 N 名候选，降低首回合误命中答案导致 minG 违规的概率
+      const sortedCands = cands.slice().sort((a, b) => playerPopularity(b) - playerPopularity(a));
+      const topExclude = new Set(sortedCands.slice(0, Math.min(sortedCands.length, 15)));
+      topExclude.add(effModal); // 也排除最可能答案，进一步降低 turn-0 误命中概率
+      selPool = all.filter(c => !excluded.has(c) && !topExclude.has(c));
+    }
+    if (!selPool.length) {
+      const any = all.filter(c => !excluded.has(c) && c !== effModal);
+      return any.length ? any[Math.floor(Math.random() * any.length)] : -1;
+    }
+    // 增益与百分位：以全部选手为基准计算（近似服务端 entropyPercentile）
+    const bench = all;
+    const benchGain = new Array(bench.length);
+    for (let i = 0; i < bench.length; i++) benchGain[i] = guessInfoGain(bench[i], cands);
+    const sorted = benchGain.slice().sort((a, b) => a - b);
+    const pctlOf = g => {
+      const gv = guessInfoGain(g, cands);
+      let lo = 0, hi = sorted.length;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (sorted[mid] <= gv + 1e-9) lo = mid + 1; else hi = mid; }
+      return lo / sorted.length;
+    };
+    let inBand = selPool.map(g => ({ g, gain: guessInfoGain(g, cands), pctl: pctlOf(g) }));
+    const band = targetBand();
+    let filtered = inBand.filter(s => s.pctl >= band.lo && s.pctl <= band.hi);
+    if (filtered.length < 3) filtered = inBand.filter(s => s.pctl >= band.lo * 0.6 && s.pctl <= Math.min(1, band.hi + 0.18));
+    if (!filtered.length) filtered = inBand;
+    // 绿色单调性启发式：用 modal 候选作为答案代理，偏好 green ≥ bestGreens 的猜测。
+    // 候选不足时按容忍度递降（-1/-2）选取，把回退幅度限制在小幅，避免面板绿格大幅跳水。
+    // 信息增益饥饿检测：若绿色集最佳增益远低于无过滤集（紧凑簇场景），放宽容忍度或跳过过滤，
+    // 避免饿死收敛导致败局。保 win=1.0 优先于 greenReg。
+    if (bestGreens > 0 && cands.length > 1) {
+      const proxy = modalCandidate(cands, excluded);
+      if (proxy >= 0) {
+        for (const s of filtered) {
+          s.greens = attrLevels(s.g, proxy).filter(v => v === 0).length;
+        }
+        const unfilteredMaxGain = (() => { let mx = 0; for (const s of filtered) if (s.gain > mx) mx = s.gain; return mx; })();
+        for (let tol = 0; tol <= 2; tol++) {
+          const mono = filtered.filter(s => s.greens >= bestGreens - tol);
+          if (mono.length >= 1) {
+            const monoMaxGain = (() => { let mx = 0; for (const s of mono) if (s.gain > mx) mx = s.gain; return mx; })();
+            if (monoMaxGain >= 0.6 * unfilteredMaxGain) {
+              filtered = mono;
+              break;
+            }
+          }
+        }
+        // 所有容忍度都饿死增益 → 不过滤，保留原分数排序（接受偶发回退以保 win=1.0）
+      }
+    }
+    // 混合打分：候选多时偏信息增益（快速收敛），候选少时偏流行度（自然收尾）
+    const needInfo = cands.length > 20;
+    const popW = needInfo ? Math.max(0.1, 0.35 - turn * 0.05) : Math.max(0.2, 0.6 - turn * 0.12);
+    const gainW = 1 - popW;
+    let maxPop = 1, maxGain = 1e-9;
+    for (const s of filtered) { const p = playerPopularity(s.g); if (p > maxPop) maxPop = p; if (s.gain > maxGain) maxGain = s.gain; }
+    for (const s of filtered) s.score = popW * (playerPopularity(s.g) / maxPop) + gainW * (s.gain / maxGain);
+    filtered.sort((a, b) => b.score - a.score);
+    // 绿色单调性保证（强形式）：对分数前 40 的猜测逐一验证其相对「所有候选」的绿色数
+    // 都 ≥ bestGreens——无论真实答案是谁，面板绿格都不会回退。bestGreens ≤ 4 时启用
+    // （v0.7.0 从 ≤3 提升至 ≤4：双胞胎簇已由 isTwinCluster 独立处理，强约束不再诱发簇陷阱）。
+    // 附区分力守卫：safe 集最佳信息增益须 ≥ 头部 85%，防饿死收敛。
+    if (bestGreens > 0 && bestGreens <= 4 && cands.length > 1) {
+      const head = filtered.slice(0, 40);
+      const annotated = head.map(s => {
+        let mn = 99;
+        for (const c of cands) {
+          const lv = attrLevels(s.g, c);
+          let g = 0;
+          for (let i = 0; i < lv.length; i++) if (lv[i] === 0) g++;
+          if (g < mn) mn = g;
+        }
+        s._minG = mn;
+        return s;
+      });
+      let headMaxGain = 1e-9; for (const s of annotated) if (s.gain > headMaxGain) headMaxGain = s.gain;
+      const safe = annotated.filter(s => s._minG >= bestGreens);
+      let safeMaxGain = 0; for (const s of safe) if (s.gain > safeMaxGain) safeMaxGain = s.gain;
+      if (safe.length && safeMaxGain >= 0.85 * headMaxGain) {
+        filtered = safe.concat(filtered.slice(40));
+      } else {
+        const soft = annotated.filter(s => s._minG >= bestGreens - 1);
+        let softMaxGain = 0; for (const s of soft) if (s.gain > softMaxGain) softMaxGain = s.gain;
+        if (soft.length && softMaxGain >= 0.85 * headMaxGain) {
+          filtered = soft.concat(filtered.slice(40));
+        }
+        // 否则不过滤：保留原分数排序，接受偶发回退以保 win=1.0
+      }
+    }
+    // 开局多样性：首回合扩大 top-K 池，降低固定开场概率
+    const K = turn === 0 ? Math.min(8, filtered.length) : Math.min(5, filtered.length);
+    const top = filtered.slice(0, K);
+    // 线性递减权重（开局更均匀）
+    const w = top.map((_, i) => turn === 0 ? 1 : (K - i));
+    const sum = w.reduce((a, b) => a + b, 0);
+    let r = Math.random() * sum, acc = 0;
+    for (let i = 0; i < top.length; i++) { acc += w[i]; if (r <= acc) { recordPercentile(top[i].pctl); return top[i].g; } }
+    recordPercentile(top[top.length - 1].pctl);
+    return top[top.length - 1].g;
+  }
+
+  // 确认答案后的「近似答案」递补：猜与答案属性差异 1-4 的未猜选手，
+  // 营造「在相似选手之间犹豫」的自然观感，绝不提交已确认的答案。
+  // 绿色单调性保证：near-miss 的绿色格数 ≥ bestGreens（历史最高），且逐步递增，
+  // 实现「面板逐渐变绿」的自然效果。remainingFill 控制递增步幅。
+  function pickNearMiss(answerIdx, excluded, bestGreens, remainingFill, avoid) {
+    const avoidSet = avoid instanceof Set ? avoid : null;
+    const cand = all
+      .filter(c => !excluded.has(c) && c !== answerIdx && (!avoidSet || !avoidSet.has(c)))
+      .map(c => ({ c, d: guessDistance(c, answerIdx), g: attrLevels(c, answerIdx).filter(v => v === 0).length }))
+      .filter(x => x.d >= 1 && x.d <= 7);
+    if (!cand.length) {
+      const any = all.filter(c => !excluded.has(c) && c !== answerIdx);
+      return any.length ? any[Math.floor(Math.random() * any.length)] : -1;
+    }
+    // 绿色单调性：优先 green ≥ bestGreens 的候选，避免面板绿格回退
+    if (bestGreens > 0) {
+      const mono = cand.filter(x => x.g >= bestGreens);
+      if (mono.length >= 1) {
+        // 渐进递增：根据剩余填充次数均匀分配 green 增量，实现平滑变绿
+        const maxGreen = 7; // 非答案猜测最多 7 绿（8=答案本身）
+        const step = Math.max(1, Math.ceil((maxGreen - bestGreens) / remainingFill));
+        const targetCeil = remainingFill > 1 ? Math.min(maxGreen, bestGreens + step) : maxGreen;
+        const progressive = mono.filter(x => x.g >= bestGreens && x.g <= targetCeil);
+        const pool = progressive.length >= 2 ? progressive : mono;
+        pool.sort((a, b) => a.d - b.d || b.g - a.g);
+        const top = pool.slice(0, Math.min(8, pool.length));
+        const w = top.map((_, i) => top.length - i);
+        const sum = w.reduce((a, b) => a + b, 0);
+        let r = Math.random() * sum, acc = 0;
+        for (let i = 0; i < top.length; i++) { acc += w[i]; if (r <= acc) return top[i].c; }
+        return top[top.length - 1].c;
+      }
+    }
+    // 无 bestGreens 约束或单调候选耗尽：优先选绿格数最高的（把回退幅度压到最小），
+    // 再按距离加权随机；bestGreens=0 时退化为纯距离偏好
+    cand.sort((a, b) => (bestGreens > 0 ? (b.g - a.g) || (a.d - b.d) : a.d - b.d));
+    const top = cand.slice(0, Math.min(8, cand.length));
+    const w = top.map((_, i) => top.length - i);
+    const sum = w.reduce((a, b) => a + b, 0);
+    let r = Math.random() * sum, acc = 0;
+    for (let i = 0; i < top.length; i++) { acc += w[i]; if (r <= acc) return top[i].c; }
+    return top[top.length - 1].c;
+  }
+
+  // 双胞胎簇检测：候选集内所有选手属性两两全同（反馈无法进一步区分）。
+  // 一旦锁死，任何猜测都不能分裂该簇——需特殊处理以避免耗尽回合或绿格回退。
+  function isTwinCluster(cands) {
+    if (cands.length < 2) return false;
+    const base = cands[0];
+    for (let i = 1; i < cands.length; i++) {
+      const lv = attrLevels(cands[i], base);
+      for (let j = 0; j < lv.length; j++) if (lv[j] !== 0) return false;
+    }
+    return true;
+  }
+
+  // 控场决策主入口（纯函数：依据传入状态返回猜测索引）。
+  // 非控场模式完全沿用原 pickGuess（excluded 即原版传入的猜测排除集），保障「不影响非控场模式」。
+  function decideMultiGuess(o) {
+    const cands = o.candidates;
+    const excluded = o.excluded;
+    const turn = o.turn;
+    const maxGuesses = o.maxGuesses;
+    const remaining = maxGuesses - turn;
+    if (!cands.length) return -1;
+
+    // 非控场：行为与原版逐字一致（含 available 兜底，避免候选耗尽时重猜已猜选手）
+    if (!o.handicapEnabled) {
+      const available = cands.filter(c => !excluded.has(c));
+      if (!available.length) return all.find(c => !excluded.has(c));
+      return pickGuess(enc, cands, cands, excluded, remaining);
+    }
+
+    const minG = o.roundMinGuesses;
+    const lastSolveTurn = Math.max(0, minG - 1); // 允许获胜的最后探路回合（0 基）
+    const confirmed = cands.length === 1;
+    const twinLocked = isTwinCluster(cands); // 属性全同簇：反馈无法进一步区分
+    const bestGreens = o.bestGreens || 0;
+
+    // 确认答案（或双胞胎锁死）但未达最小猜测次数：近似答案递补，绝不提交答案
+    if ((confirmed || twinLocked) && turn < minG) {
+      if (twinLocked) {
+        // 双胞胎簇：反馈无法区分，唯一策略是逐一尝试。计算最晚安全开局：
+        // latestStart = maxGuesses - clusterSize，此后每回合必须猜簇内选手否则回合不够。
+        const latestStart = maxGuesses - cands.length;
+        if (turn >= latestStart) {
+          return modalCandidate(cands, excluded);
+        }
+        // 还有余量：near-miss 填充至 latestStart，然后开始枚举
+        const proxy = modalCandidate(cands, excluded);
+        const remainingFill = latestStart - turn;
+        const avoid = new Set(cands);
+        return pickNearMiss(proxy, excluded, bestGreens, remainingFill, avoid);
+      }
+      const remainingFill = minG - turn; // 还需填充几次（含本次）
+      return pickNearMiss(cands[0], excluded, bestGreens, remainingFill);
+    }
+    // 已过最小猜测窗口：正常求解（允许获胜）；确认则提交
+    if (turn >= minG) {
+      if (confirmed) return cands[0];
+      // 双胞胎锁死：逐一尝试簇内选手（唯一选项，pickGuess 无法分裂全同簇）
+      if (twinLocked) return modalCandidate(cands, excluded);
+      // 候选数 > 剩余步数时无法逐一枚举，用全局池求解以最大化信息增益（仅控场模式）
+      const solvePool = cands.length > remaining ? all : cands;
+      return pickGuess(enc, cands, solvePool, excluded, remaining);
+    }
+    // 探路/逼近阶段（turn < minG, candidates>1）
+    const blockWin = turn < lastSolveTurn;
+    if (blockWin) {
+      // 禁胜窗口：只从候选集外选，保证绝不提前命中答案（winTurn 必 ≥ minG）。
+      // 候选集外的猜测仍能按属性匹配给答案上色（绿/黄），面板自然变绿，且对候选集有信息增益。
+      return pickNaturalGuess({ cands, excluded, turn, outsideOnly: true, modalAns: -1, bestGreens, remaining });
+    }
+    // 到达允许获胜回合（turn === lastSolveTurn）：候选很少时直接猜最可能答案（赶在 deadline 命中），
+    // 否则自然逼近（可能命中，winTurn=minG，合规）
+    if (cands.length <= 4) {
+      const m = modalCandidate(cands, excluded);
+      if (m >= 0) return m;
+    }
+    // 败局警戒：候选数 > 剩余步数时，自然猜测的信息增益不足以保证获胜，
+    // 切换到 minimax 全局池求解（仅控场模式，不影响等价性）
+    if (cands.length > remaining) {
+      return pickGuess(enc, cands, all, excluded, remaining);
+    }
+    return pickNaturalGuess({ cands, excluded, turn, outsideOnly: false, modalAns: -1, bestGreens, remaining });
+  }
+
+  function newHandicapPlan() {
+    return { opened: false };
+  }
+  // === CORE-END ===
   function handicapEnabled() {
     return loadSettings().handicap.enabled;
   }
@@ -485,23 +646,27 @@
     return multi.handicapLose;
   }
 
-  // 提交前延迟（毫秒）：始终在用户设定区间 [lo, hi] 内，
-  // 候选数只影响在区间内的偏移（候选多偏上界，候选少偏下界），不会突破下界。
+  // 提交前延迟（毫秒）—— 人性化「思考时间」模型：
+  // - 开局（turn 0）偏快：人类有现成的开局选手，反应短
+  // - 中段随候选数对数增长：候选越多越费思量
+  // - 偶发长考（约 12%）：模拟「拿不准、反复权衡」
+  // 始终落在用户设定区间 [lo, hi] 内，候选数与回合只影响区间内偏移，不突破下界。
   function handicapDelayMs() {
     const h = handicapConfig();
     if (!h.enabled) return 0;
     const lo = Math.max(1, h.delaySecMin || 3);
     const hi = Math.max(lo + 1, h.delaySecMax || lo + 1);
-    // 候选数决定在区间内的位置：候选多取上段，候选少取下段
     const cands = multi.candidates.length;
-    let bias;
-    if (cands > 50) bias = 0.7 + Math.random() * 0.3;       // 70%~100% 位置
-    else if (cands > 15) bias = 0.4 + Math.random() * 0.3;  // 40%~70%
-    else bias = 0.1 + Math.random() * 0.3;                   // 10%~40%
+    const turn = multi.turn;
+    // 候选数对数映射到区间内的基础位置（候选多→偏上界）
+    const candPos = cands > 1 ? Math.min(1, Math.log2(cands) / 10) : 0.1;
+    // 回合修正：开局更快（-0.2），后期略慢（+0.1）
+    const turnAdj = turn === 0 ? -0.2 : Math.min(0.15, turn * 0.03);
+    let bias = Math.max(0.05, Math.min(0.95, candPos + turnAdj + (Math.random() - 0.5) * 0.25));
+    // 偶发长考：约 12% 概率把延迟推到区间上段
+    if (Math.random() < 0.12) bias = Math.max(bias, 0.75 + Math.random() * 0.2);
     const sec = lo + (hi - lo) * bias;
-    // 微小抖动 ±0.8s，保证不低于用户设定的最小值
-    const jitter = (Math.random() - 0.5) * 1.6;
-    return Math.max(lo * 1000, (sec + jitter) * 1000);
+    return Math.max(lo * 1000, Math.round(sec * 1000));
   }
 
   // 放水：点击"跳过本局"按钮（lucide-skip-forward 图标定位，语言无关）。
@@ -538,102 +703,10 @@
   const SUBMIT_ROW_TIMEOUT = 10000;
   const GUESS_COOLDOWN_MS = 1600;
 
-  // ---------- 数据同步 ----------
-  const GITHUB_DB_URL = 'https://raw.githubusercontent.com/shnlfriberg/csgo-major-db/main/players.json';
-  const GITHUB_API_COMMITS = 'https://api.github.com/repos/shnlfriberg/csgo-major-db/commits?per_page=1';
-  const GITHUB_TIMEOUT_MS = 10_000;
-
-  // 从 GitHub 数据仓库拉取选手属性（snake_case、无 id）。
-  // 页面 CSP 的 connect-src 不含 raw.githubusercontent.com，必须用 GM_xmlhttpRequest
-  //（扩展沙箱执行，不受页面 CSP 与 CORS 限制），超时/网络错误抛出统一错误码。
-  function fetchGitHubDb() {
-    return new Promise((resolve, reject) => {
-      const fail = () => { clearTimeout(timer); reject(new Error('GITHUB_DB_UNAVAILABLE')); };
-      const timer = setTimeout(fail, GITHUB_TIMEOUT_MS);
-      GM_xmlhttpRequest({
-        method: 'GET',
-        url: GITHUB_DB_URL,
-        timeout: GITHUB_TIMEOUT_MS,
-        onload: res => {
-          clearTimeout(timer);
-          try {
-            const obj = JSON.parse(res.responseText);
-            if (Array.isArray(obj) && obj.length > 0) resolve(obj);
-            else fail();
-          } catch { fail(); }
-        },
-        onerror: fail,
-        ontimeout: fail,
-      });
-    });
-  }
-
-  // 查询数据仓库最新提交 sha（用于更新检测），任何失败返回 null
-  function fetchDbCommitSha() {
-    return new Promise(resolve => {
-      GM_xmlhttpRequest({
-        method: 'GET',
-        url: GITHUB_API_COMMITS,
-        timeout: GITHUB_TIMEOUT_MS,
-        onload: res => {
-          try {
-            const arr = JSON.parse(res.responseText);
-            const sha = arr && arr[0] && typeof arr[0].sha === 'string' ? arr[0].sha : null;
-            resolve(sha);
-          } catch { resolve(null); }
-        },
-        onerror: () => resolve(null),
-        ontimeout: () => resolve(null),
-      });
-    });
-  }
-
-  /**
-   * 选手库同步：完全从 csgo-major-db（csgofriberg 官方数据仓库）获取，不依赖游戏服务器，
-   * 避免服务器限流影响。数据仓库字段为 snake_case 且不含 id，这里统一转为脚本内部格式。
-   */
-  async function fetchAllPlayers() {
-    const [dbPlayers, commitSha] = await Promise.all([fetchGitHubDb(), fetchDbCommitSha()]);
-    const players = dbPlayers
-      .map(p => ({
-        id: typeof p.id === 'number' ? p.id : null,
-        nickname: p.nickname,
-        nationality: p.nationality,
-        region: p.region,
-        team: p.team,
-        age: p.age,
-        role: p.role,
-        majorChampionships: p.major_championships,
-        majorAppearances: p.major_appearances,
-        isActive: p.is_active !== undefined ? p.is_active : true,
-        difficulties: Array.isArray(p.difficulties) ? p.difficulties : [],
-      }))
-      .sort((a, b) => a.nickname.localeCompare(b.nickname, 'zh-CN'));
-    return { version: 'csgo-major-db', commitSha, players };
-  }
-
-  // 启动后检查数据仓库是否有新版本（10 分钟冷却）。
-  // 注意：服务器数据库由管理员手工导入维护，可能与数据仓库不同步；
-  // 盲目同步到仓库最新反而会造成与服务器不一致，这里仅提示，不自动更新。
-  let lastDbUpdateCheck = 0;
-  function checkDbUpdate() {
-    if (!cache || !cache.commitSha) return;
-    if (Date.now() - lastDbUpdateCheck < 10 * 60_000) return;
-    lastDbUpdateCheck = Date.now();
-    fetchDbCommitSha().then(sha => {
-      if (sha && cache && cache.commitSha && sha !== cache.commitSha) {
-        setStatus('数据仓库有新版本；服务器数据库可能未同步到同一版本，请确认后再手动同步');
-      }
-    });
-  }
-
-  const SYNC_ERROR_TEXT = {
-    GITHUB_DB_UNAVAILABLE: 'GitHub 数据仓库不可用（网络问题），请用「导入 JSON」选择本地选手文件（如 data/players_full.json）',
-  };
-  function syncErrorMessage(err) {
-    if (err instanceof Error && SYNC_ERROR_TEXT[err.message]) return SYNC_ERROR_TEXT[err.message];
-    return '同步失败：' + (err instanceof Error ? err.message : String(err));
-  }
+  // ---------- 选手库数据 ----------
+  // 数据来源：用户本地导入 JSON（仓库 data/players_full.json）。
+  // 不再依赖任何远程数据仓库（csgo-major-db 已下线/404），避免网络依赖与版本不一致问题。
+  // 兼容 snake_case（仓库原始格式）与 camelCase（脚本内部格式）两种字段。
 
   // 多人回合状态重置（新回合/行数减少/数据同步后统一调用）
   function resetMultiRound() {
@@ -650,13 +723,12 @@
     multi.awaitingRowAt = 0;
     multi.pendingIdx = -1;
     multi.nextSubmitAt = 0;
-    multi.handicapRefIdx = -1;
-    multi.handicapPadSeq = null;
-    multi.handicapPadPos = 0;
-    multi.handicapLastLv = null;
+    multi.handicapPlan = newHandicapPlan();
+    multi.bestGreens = 0;
     rollHandicapLose();
   }
 
+  // 重新导入选手库后重置单人/多人对局状态（与原 resetMultiAfterDataSync 合并入口）。
   // 多人对局进行中更换选手库后，候选集/已猜索引会全部失效，
   // 必须按新库重置状态并重放已有反馈行
   function resetMultiAfterDataSync() {
@@ -670,22 +742,59 @@
     if (!multi.ended) computeMultiFill();
   }
 
-  // 从 GitHub 数据仓库同步选手库；同步后重置单人/多人对局状态。
-  // 警告：服务器数据库由管理员手工导入，可能落后于数据仓库；
-  // 若服务器未同步到仓库最新，使用「导入 JSON」导入与服务器一致的本地数据更稳妥。
-  async function syncFromGitHub() {
-    try {
-      const fresh = await fetchAllPlayers();
-      cache = fresh;
-      savePlayersCache(fresh);
-      ensureEncoded();
-      if (state.inGame) { state.candidates = all.slice(); state.guessed = new Set(); computeAndFill(); }
-      resetMultiAfterDataSync();
-      return true;
-    } catch (e) {
-      setStatus(syncErrorMessage(e));
-      return false;
+  // 缓存规范化：补齐 sources / sourceMap 字段；旧版缓存迁移。
+  // 迁移策略——用服务器同步进度(prog.synced)还原各选手来源：当前服务器版本下已确认的昵称=server，其余=import(本地)。
+  function normalizeCache() {
+    if (!cache) return;
+    if (!cache.players) cache.players = [];
+    if (!cache.sources) cache.sources = {};
+    if (!cache.sourceMap) {
+      const sm = {};
+      const prog = loadServerSync();
+      const serverMatch = prog.version && cache.version === prog.version;
+      for (const p of cache.players) {
+        if (p && p.nickname) {
+          sm[p.nickname] = (serverMatch && prog.synced && prog.synced[p.nickname]) ? 'server' : 'import';
+        }
+      }
+      cache.sourceMap = sm;
+      if (Object.values(sm).indexOf('server') >= 0) cache.sources.server = true;
+      if (Object.values(sm).indexOf('import') >= 0) cache.sources.import = true;
     }
+  }
+
+  // 通用增量合并（核心）：按来源优先级合并 incoming 到 local，绝不删除既有选手。
+  // 冲突(同昵称)：incoming 优先级 >= 既有 → 覆盖；否则保持既有。不冲突 → 追加。
+  // 返回 { players, sourceMap, replaced, added, kept, total }（纯函数，无副作用）。
+  function mergePlayersByPriority(localPlayers, localSourceMap, incoming, incomingSource) {
+    const local = (localPlayers || []).slice();
+    const sm = Object.assign({}, localSourceMap || {});
+    const idxByNick = new Map(local.map((p, i) => [p.nickname, i]));
+    const dedup = new Map();
+    for (const sp of (incoming || [])) { if (sp && sp.nickname) dedup.set(sp.nickname, sp); }
+    let replaced = 0, added = 0;
+    const incPrio = SOURCE_PRIO[incomingSource] || 0;
+    for (const sp of dedup.values()) {
+      const existing = sm[sp.nickname];
+      if (existing === undefined) {
+        idxByNick.set(sp.nickname, local.length);
+        local.push(sp); sm[sp.nickname] = incomingSource; added++;
+      } else if (incPrio >= (SOURCE_PRIO[existing] || 0)) {
+        local[idxByNick.get(sp.nickname)] = sp; sm[sp.nickname] = incomingSource; replaced++;
+      }
+    }
+    local.sort((a, b) => (a.nickname || '').localeCompare((b.nickname || ''), 'zh-CN'));
+    return { players: local, sourceMap: sm, replaced, added, kept: local.length - added, total: local.length };
+  }
+
+  // 合并后统一落盘 + 重建编码 + 重置进行中的对局 + 刷新来源徽标（导入 / 仓库拉取共用）。
+  function applyMergedPlayers() {
+    savePlayersCache(cache);
+    ensureEncoded();
+    if (state.inGame) { state.candidates = all.slice(); state.guessed = new Set(); state.turn = 0; state.lastIdx = -1; computeAndFill(); }
+    resetMultiAfterDataSync();
+    updateDataSourceBadge();
+    updateLibSummary();
   }
 
   function ensureEncoded() {
@@ -697,33 +806,16 @@
     return false;
   }
 
-  // 首次同步失败后仅自动重试一次（5 秒），再失败就交给手动导入/同步
-  let retriedDataSync = false;
-
-  async function ensureData() {
+  // 首次使用无本地选手库：自动从仓库拉取 players_full.json 作为初始数据（大多数用户的零操作路径）。
+  // 拉取异步进行，完成后自动装入并刷新面板；失败时状态栏提示并提供「重试拉取」入口。
+  let _repoFetching = false;
+  function ensureData() {
     if (ensureEncoded()) {
       if (state.inGame && state.lastIdx < 0) computeAndFill();
       return true;
     }
-    if (retriedDataSync) {
-      setStatus('选手库获取失败，请点面板「导入 JSON」选择本地选手文件，或稍后点「同步选手库」重试');
-      return false;
-    }
-    // 首次使用无本地选手库：默认从 GitHub 数据仓库获取，失败 5 秒后自动重试一次
-    setStatus('选手库为空：正在从 GitHub 数据仓库获取...');
-    try {
-      const fresh = await fetchAllPlayers();
-      cache = fresh;
-      savePlayersCache(fresh);
-      ensureEncoded();
-      setStatus(`选手库获取成功（v${fresh.version}，${fresh.players.length} 人）`);
-      return true;
-    } catch (e) {
-      retriedDataSync = true;
-      setStatus(syncErrorMessage(e) + '，5 秒后自动重试一次');
-      setTimeout(() => { void ensureData(); }, 5000);
-      return false;
-    }
+    if (!_repoFetching) { _repoFetching = true; fetchAndMergeRepo(false).finally(() => { _repoFetching = false; }); }
+    return false;
   }
 
   // ---------- 导入本地 JSON ----------
@@ -740,7 +832,7 @@
       role: p.role,
       majorChampionships: p.majorChampionships !== undefined ? p.majorChampionships : p.major_championships,
       majorAppearances: p.majorAppearances !== undefined ? p.majorAppearances : p.major_appearances,
-      isActive: p.isActive !== undefined ? p.isActive : (p.is_active !== undefined ? p.is_active : true),
+      isActive: p.isActive !== undefined ? Boolean(p.isActive) : (p.is_active !== undefined ? Boolean(p.is_active) : true),
       difficulties: Array.isArray(p.difficulties) ? p.difficulties : [],
     };
   }
@@ -764,17 +856,19 @@
       return { ok: false, message: '存在重复选手昵称' };
     }
     players.sort((a, b) => a.nickname.localeCompare(b.nickname, 'zh-CN'));
-    cache = { version, players };
-    savePlayersCache(cache);
-    ensureEncoded();
-    if (state.inGame) {
-      state.candidates = all.slice();
-      state.guessed = new Set();
-      state.turn = 0;
-      state.lastIdx = -1;
-      computeAndFill();
-    }
-    return { ok: true, version, count: players.length };
+    // 增量合并（import 优先级：高于仓库，低于服务器；不清空既有数据）。
+    normalizeCache();
+    const local = (cache && cache.players) ? cache.players.slice() : [];
+    const sm = Object.assign({}, (cache && cache.sourceMap) || {});
+    const res = mergePlayersByPriority(local, sm, players, 'import');
+    cache = Object.assign({}, cache || {}, {
+      version: (cache && cache.version) ? cache.version : version, // 不覆盖已有版本（如服务器版本）
+      players: res.players,
+      sourceMap: res.sourceMap,
+      sources: Object.assign({}, (cache && cache.sources) || {}, { import: true }),
+    });
+    applyMergedPlayers();
+    return { ok: true, version, count: players.length, added: res.added, replaced: res.replaced, total: res.total };
   }
 
   function pickJsonFile() {
@@ -803,12 +897,333 @@
       const obj = JSON.parse(text);
       const res = importPlayersFromJson(obj);
       if (res.ok) {
-        setStatus(`导入成功：${res.count} 名选手` + (res.version ? `（v${res.version}）` : '（未含版本号）'));
+        setStatus(`导入成功：合并后库共 ${res.total} 人（新增 ${res.added}，更新 ${res.replaced}）` + (res.version ? `，来源 v${res.version}` : ''));
       } else {
         setStatus('导入失败：' + res.message);
       }
     } catch (e) {
       setStatus('导入失败：' + e.message);
+    }
+  }
+
+  // ---------- 服务器数据同步 ----------
+  // 通过游戏站同源接口获取/更新选手库。@match 站点同源，PAGE.fetch 即页面原生 fetch，
+  // 无需 @connect 跨源白名单或 GM_xmlhttpRequest。
+  //   /api/players/list          → { version, players:[{id,nickname}] }（完整花名册，无限流）
+  //   /api/players?search=<nick> → 完整属性数组（服务端限流 10次/60秒/IP）
+  //
+  // 合并语义（硬要求）：本地已有数据时同步绝不一次性覆盖清空——
+  //   冲突（同昵称）以服务器为准；本地独有（服务器未返回）保持不变；服务器新增追加。
+  //   属性拉取受服务端限流，支持增量续传：已具备完整属性的选手自动跳过，可分多次同步逐步累积。
+  const PLAYER_SEARCH_RATE_LIMIT = 9;       // 服务端 10/60s，留 1 余量
+  const PLAYER_SEARCH_WINDOW_MS = 60000;
+  let _syncState = null;                    // { running, cancel, fetched, skipped, total, version, abortCtrl, cancelResolvers }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  // 同源 fetch（@match 站点），带超时。PAGE.fetch 即页面原生 fetch；旧环境兜底 window.fetch。
+  // extSignal：可选的外部取消信号（同步级 AbortController），取消时一并中止在途请求。
+  function serverFetch(url, timeoutMs, extSignal) {
+    const fetchFn = (PAGE && PAGE.fetch) ? PAGE.fetch.bind(PAGE) : (typeof fetch === 'function' ? fetch : null);
+    if (!fetchFn) return Promise.reject(new Error('当前环境无可用 fetch'));
+    const ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, timeoutMs || 15000) : null;
+    if (ctrl && extSignal) {
+      if (extSignal.aborted) { try { ctrl.abort(); } catch (e) {} }
+      else { extSignal.addEventListener('abort', () => { try { ctrl.abort(); } catch (e) {} }); }
+    }
+    return fetchFn(url, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined }).finally(() => { if (timer) clearTimeout(timer); });
+  }
+
+  // 拉取花名册（id+nickname+version），快速、无限流
+  async function fetchServerRoster(signal) {
+    const res = await serverFetch('/api/players/list', 15000, signal);
+    if (!res.ok) throw new Error('花名册请求失败 HTTP ' + res.status);
+    const data = await res.json();
+    const list = Array.isArray(data) ? data : (data && data.players) || [];
+    if (!list.length) throw new Error('服务器花名册为空');
+    return { version: (data && (data.listVersion || data.version)) || null, players: list };
+  }
+
+  // 拉取单个选手完整属性（受限流）。返回 normalize 后对象 / {rateLimited:true} / null
+  async function fetchServerPlayerAttr(nickname, signal) {
+    const res = await serverFetch('/api/players?search=' + encodeURIComponent(nickname), 12000, signal);
+    if (res.status === 429) return { rateLimited: true };
+    if (!res.ok) return null;
+    const arr = await res.json();
+    if (!Array.isArray(arr) || !arr.length) return null;
+    const exact = arr.find(p => p && p.nickname === nickname) || arr[0];
+    return normalizePlayerFields(exact);
+  }
+
+  // 轻量合并：仅更新 cache.players/sourceMap 与 version 并持久化，不重建 enc、不重置对局状态。
+  // 冲突→服务器为准（优先级最高）；本地独有→保留；服务器新增→追加。返回 {replaced,added,kept,total}
+  function mergeIntoCacheLight(serverPlayers, version) {
+    normalizeCache();
+    const local = (cache && cache.players) ? cache.players.slice() : [];
+    const sm = Object.assign({}, (cache && cache.sourceMap) || {});
+    const res = mergePlayersByPriority(local, sm, serverPlayers, 'server');
+    cache = Object.assign({}, cache || {}, {
+      version: version || (cache && cache.version) || null,
+      players: res.players,
+      sourceMap: res.sourceMap,
+      sources: Object.assign({}, (cache && cache.sources) || {}, { server: true }),
+    });
+    savePlayersCache(cache);
+    return { replaced: res.replaced, added: res.added, kept: res.kept, total: res.total };
+  }
+
+  // 同步完成/取消后重建编码与对局状态（一次性，避免逐条同步反复打断进行中的对局）
+  function applyMergedData() {
+    ensureEncoded();
+    if (state.inGame) { state.candidates = all.slice(); state.guessed = new Set(); state.turn = 0; state.lastIdx = -1; computeAndFill(); }
+    resetMultiAfterDataSync();
+    updateDataSourceBadge();
+    updateLibSummary();
+  }
+
+  // 取消同步：置取消标志 → 中止在途请求 → 唤醒所有可取消 sleep → 状态提示。
+  // 修复 v0.8.0「点取消卡在正在取消同步…」：长限流等待/429 退避/在途请求此前不被中断。
+  function cancelSync() {
+    if (!(_syncState && _syncState.running) || _syncState.cancel) return;
+    _syncState.cancel = true;
+    if (_syncState.abortCtrl) { try { _syncState.abortCtrl.abort(); } catch (e) {} }
+    if (_syncState.cancelResolvers && _syncState.cancelResolvers.length) {
+      _syncState.cancelResolvers.forEach(r => { try { r(); } catch (e) {} });
+      _syncState.cancelResolvers = [];
+    }
+    setStatus('正在取消同步…');
+  }
+
+  // 可取消 sleep：到点或被取消时立即 resolve（用于限流等待 / 429 退避）。
+  function syncSleep(ms) {
+    return new Promise(resolve => {
+      if (_syncState && _syncState.cancel) { resolve(); return; }
+      let done = false;
+      const finish = () => { if (!done) { done = true; clearTimeout(t); resolve(); } };
+      const t = setTimeout(finish, ms);
+      if (_syncState) _syncState.cancelResolvers.push(finish);
+    });
+  }
+
+  // 同步入口：先拉花名册，再限流拉属性，增量合并 + 进度 + 可取消 + 续传。
+  // 续传/冲突正确性由 loadServerSync 保证：仅在「当前服务器版本下已确认」的昵称跳过；
+  // 版本变更时 synced 清空 → 全量重拉，确保服务器端属性变更始终以服务器为准。
+  async function syncFromServer() {
+    if (_syncState && _syncState.running) { setStatus('正在同步中，请稍候…'); return; }
+    _syncState = { running: true, cancel: false, fetched: 0, skipped: 0, total: 0, version: null,
+      abortCtrl: (typeof AbortController === 'function') ? new AbortController() : null, cancelResolvers: [] };
+    const signal = _syncState.abortCtrl ? _syncState.abortCtrl.signal : null;
+    updateSyncButton(true);
+    const buffer = [];                       // 本轮新拉取的属性，结束时一次性合并（server wins）
+    try {
+      setStatus('正在拉取服务器花名册…');
+      const roster = await fetchServerRoster(signal);
+      if (_syncState.cancel) throw new Error('__CANCELLED__');
+      _syncState.version = roster.version;
+      _syncState.total = roster.players.length;
+      // 版本化同步进度：版本不同 → 清空已确认集合（新版本所有选手需重新以服务器为准）
+      const prog = loadServerSync();
+      if (prog.version !== roster.version) { prog.version = roster.version; prog.synced = {}; saveServerSync(prog); }
+      // 仅拉取「本版本尚未确认」的选手；已确认的（含服务器确认不存在）跳过
+      const needAttr = roster.players.filter(p => !prog.synced[p.nickname]);
+      if (!needAttr.length) {
+        // 已是最新：仅刷新版本号，不发起任何属性请求
+        if (cache) { cache.version = roster.version || cache.version; savePlayersCache(cache); }
+        setStatus(`已是最新：服务器 v${roster.version || '?'}，${roster.players.length} 人均已确认（库共 ${cache ? cache.players.length : 0} 人）`);
+        updateDataSourceBadge(); updateLibSummary();
+        return;
+      }
+      const etaMin = Math.ceil(needAttr.length / PLAYER_SEARCH_RATE_LIMIT);
+      setStatus(`服务器 v${roster.version || '?'}：${roster.players.length} 人，需拉属性 ${needAttr.length} 人（限流约 ${etaMin} 分钟，可随时取消后续传）`);
+      await syncSleep(600);
+      let reqInWindow = 0, windowStart = Date.now();
+      for (let i = 0; i < needAttr.length; i++) {
+        if (_syncState.cancel) break;
+        if (reqInWindow >= PLAYER_SEARCH_RATE_LIMIT) {
+          const wait = PLAYER_SEARCH_WINDOW_MS - (Date.now() - windowStart) + 100;
+          if (wait > 0) { setStatus(`限流等待 ${Math.ceil(wait / 1000)}s …（已拉 ${_syncState.fetched}/${needAttr.length}，可点按钮取消）`); await syncSleep(wait); }
+          if (_syncState.cancel) break;
+          reqInWindow = 0; windowStart = Date.now();
+        }
+        const nick = needAttr[i].nickname;
+        const r = await fetchServerPlayerAttr(nick, signal);
+        if (_syncState.cancel) break;
+        reqInWindow++;
+        if (r && r.rateLimited) {
+          setStatus(`服务端限流(429)，退避 60s …（已拉 ${_syncState.fetched}/${needAttr.length}，可点按钮取消）`);
+          await syncSleep(PLAYER_SEARCH_WINDOW_MS + 1000);
+          if (_syncState.cancel) break;
+          reqInWindow = 0; windowStart = Date.now(); i--; continue;
+        }
+        // 无论成功还是服务器确认不存在(null)，都标记为本版本已确认（不再重复请求）
+        prog.synced[nick] = true;
+        if (r && !r.rateLimited) { buffer.push(r); _syncState.fetched++; }
+        else { _syncState.skipped++; }
+        // 每 6 条：落盘进度 + 轻量合并已拉属性（崩溃也不丢；不重建 enc）
+        if (buffer.length >= 6) {
+          mergeIntoCacheLight(buffer.splice(0, buffer.length), roster.version);
+          saveServerSync(prog);
+        }
+        if (i % 3 === 0) { setSyncProgress((i + 1) / needAttr.length); setStatus(`同步中：${_syncState.fetched}/${needAttr.length}（v${roster.version || '?'}，可点按钮取消）`); }
+      }
+      if (buffer.length) mergeIntoCacheLight(buffer.splice(0, buffer.length), roster.version);
+      if (!_syncState.cancel) prog.lastSyncAt = Date.now();
+      saveServerSync(prog);
+      if (cache) { cache.version = roster.version || cache.version; savePlayersCache(cache); }
+      applyMergedData();
+      if (_syncState.cancel) {
+        setStatus(`同步已取消：本轮确认 ${_syncState.fetched + _syncState.skipped} 人，库共 ${cache ? cache.players.length : 0} 人（可再次点「同步服务器」续传）`);
+      } else {
+        setStatus(`同步完成：服务器 v${roster.version || '?'}，拉取 ${_syncState.fetched} 人，确认不存在 ${_syncState.skipped}，库共 ${cache ? cache.players.length : 0} 人`);
+      }
+    } catch (e) {
+      if (buffer.length) mergeIntoCacheLight(buffer.splice(0, buffer.length), _syncState.version);
+      if (_syncState && _syncState.cancel) {
+        setStatus(`同步已取消：本轮确认 ${_syncState.fetched + _syncState.skipped} 人，库共 ${cache ? cache.players.length : 0} 人（可再次点「同步服务器」续传）`);
+      } else {
+        setStatus('同步失败：' + (e && e.message ? e.message : e) + '（已拉取的部分已保留，可重试）');
+      }
+    } finally {
+      _syncState.running = false;
+      updateSyncButton(false);
+      updateDataSourceBadge();
+      updateLibSummary();
+    }
+  }
+
+  // ---------- 仓库自动拉取（首次运行 / 手动重试） ----------
+  // 用 GM_xmlhttpRequest 跨源拉取 raw.githubusercontent.com（已 @connect 声明）。
+  // 仓库数据为最低优先级：仅填充本地没有的选手，不覆盖服务器/导入数据。
+  function gmFetchJson(url, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') { reject(new Error('当前油猴环境不支持 GM_xmlhttpRequest')); return; }
+      GM_xmlhttpRequest({
+        method: 'GET', url, timeout: timeoutMs || 30000, headers: { 'Accept': 'application/json' },
+        onload: (r) => { try { resolve(JSON.parse(r.responseText)); } catch (e) { reject(new Error('仓库数据解析失败')); } },
+        onerror: () => reject(new Error('仓库拉取网络错误')),
+        ontimeout: () => reject(new Error('仓库拉取超时')),
+      });
+    });
+  }
+
+  async function fetchAndMergeRepo(force) {
+    // 自动模式（force=false）：已有本地数据则不重复拉取
+    if (!force && cache && cache.players && cache.players.length) return true;
+    if (!force) setStatus('首次使用：正在从仓库自动拉取选手库…');
+    else setStatus('正在从仓库重新拉取选手库…');
+    setRepoFetching(true);
+    try {
+      const obj = await gmFetchJson(REPO_DATA_URL, 30000);
+      const raw = Array.isArray(obj) ? obj : (obj && obj.players);
+      if (!Array.isArray(raw) || !raw.length) throw new Error('仓库数据为空');
+      const players = raw.map(normalizePlayerFields);
+      const sample = players.find(p => p && typeof p === 'object');
+      if (!sample) throw new Error('仓库数据格式无效');
+      const version = (obj && (obj.listVersion || obj.version)) || null;
+      normalizeCache();
+      const local = (cache && cache.players) ? cache.players.slice() : [];
+      const sm = Object.assign({}, (cache && cache.sourceMap) || {});
+      const res = mergePlayersByPriority(local, sm, players, 'repo');
+      cache = Object.assign({}, cache || {}, {
+        version: (cache && cache.version) ? cache.version : version,
+        players: res.players,
+        sourceMap: res.sourceMap,
+        sources: Object.assign({}, (cache && cache.sources) || {}, { repo: true }),
+        repoVersion: version,
+        repoAt: Date.now(),
+      });
+      applyMergedPlayers();
+      setStatus(`已从仓库拉取 ${players.length} 名选手（库共 ${res.total} 人${res.added < players.length ? `，新增 ${res.added}` : ''}）`);
+      return true;
+    } catch (e) {
+      setStatus('仓库拉取失败：' + (e && e.message ? e.message : e) + '（可点「重试拉取」，或手动「导入 JSON」/「同步服务器」）');
+      updateDataSourceBadge(); updateLibSummary();
+      return false;
+    } finally {
+      setRepoFetching(false);
+    }
+  }
+
+  function setRepoFetching(flag) {
+    if (!panelRoot) return;
+    const ids = ['fb-import', 'fb-sync', 'fb-repo'];
+    ids.forEach(id => { const b = panelRoot.getElementById(id); if (b) b.disabled = flag; });
+    const repo = panelRoot.getElementById('fb-repo');
+    if (repo) repo.textContent = flag ? '拉取中…' : '重试拉取';
+  }
+
+  function updateSyncButton(syncing) {
+    if (!panelRoot) return;
+    const btn = panelRoot.getElementById('fb-sync');
+    if (btn) {
+      if (syncing) { btn.textContent = '取消同步'; btn.classList.add('syncing'); }
+      else { btn.textContent = '同步服务器'; btn.classList.remove('syncing'); }
+    }
+    const imp = panelRoot.getElementById('fb-import');
+    if (imp) imp.disabled = syncing;   // 同步中禁用导入，避免数据竞争
+    const repo = panelRoot.getElementById('fb-repo');
+    if (repo) repo.disabled = syncing; // 同步中禁用仓库拉取
+    const progBar = panelRoot.getElementById('fb-sync-prog');
+    if (progBar) progBar.classList.toggle('show', syncing);
+    if (!syncing) setSyncProgress(0);
+  }
+
+  function setSyncProgress(frac) {
+    if (!panelRoot) return;
+    const fill = panelRoot.getElementById('fb-sync-fill');
+    if (fill) fill.style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
+  }
+
+  // 来源构成文案：仓库 / 本地 / 服务器 各自是否贡献数据，多源用「+」连接。
+  function sourceLabel() {
+    normalizeCache();
+    const s = (cache && cache.sources) || {};
+    const parts = [];
+    if (s.repo) parts.push('仓库');
+    if (s.import) parts.push('本地');
+    if (s.server) parts.push('服务器');
+    if (!parts.length) return (cache && cache.players && cache.players.length) ? '本地' : '无';
+    return parts.join('+');
+  }
+
+  // 顶部数据来源徽标：按真实来源构成显示（仓库/本地/服务器/混合/无）。
+  function updateDataSourceBadge() {
+    if (!panelRoot) return;
+    const el = panelRoot.getElementById('fb-src');
+    if (!el) return;
+    const label = sourceLabel();
+    el.textContent = label;
+    const multi = label.indexOf('+') >= 0;
+    el.classList.toggle('merged', multi);
+  }
+
+  // 选手库卡片摘要 + 折叠详情：人数/版本/来源构成/更新时间，各来源人数明细。
+  function updateLibSummary() {
+    if (!panelRoot) return;
+    const sum = panelRoot.getElementById('fb-lib-sum');
+    const det = panelRoot.getElementById('fb-lib-detail-text');
+    normalizeCache();
+    const n = cache && cache.players ? cache.players.length : 0;
+    const v = cache && cache.version ? cache.version : '—';
+    const label = sourceLabel();
+    if (sum) sum.textContent = n ? `${n} 人 · ${label} · v${v}` : '无数据';
+    if (det) {
+      const prog = loadServerSync();
+      const sm = (cache && cache.sourceMap) || {};
+      const cnt = (lbl) => Object.keys(sm).filter(k => sm[k] === lbl).length;
+      const repoV = (cache && cache.repoVersion) ? cache.repoVersion : '—';
+      const repoAt = (cache && cache.repoAt) ? new Date(cache.repoAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '未拉取';
+      const lastSync = prog.lastSyncAt ? new Date(prog.lastSyncAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '从未同步';
+      const syncedN = Object.keys(prog.synced || {}).length;
+      const lines = [
+        `库人数：${n}　版本：v${v}　来源：${label}`,
+        `仓库自动拉取：v${repoV}，上次 ${repoAt}`,
+        `服务器同步：v${prog.version || '未同步'}，已确认 ${syncedN} 人，上次 ${lastSync}`,
+        `来源构成：仓库 ${cnt('repo')} · 本地导入 ${cnt('import')} · 服务器 ${cnt('server')}`,
+        `优先级：服务器 > 本地导入 > 仓库；任何来源不会清空既有数据。`,
+      ];
+      det.textContent = lines.join('\n');
     }
   }
 
@@ -917,7 +1332,8 @@
       max: state.maxGuesses,
       nick: enc.nicks[g],
       exp: expCount,
-      statusLine: state.statusLine || ''
+      statusLine: state.statusLine || '',
+      twinLocked: cands.length > 1 && isTwinCluster(cands)
     });
     if (loadSettings().autoFill) fillInput(enc.nicks[g]);
   }
@@ -974,7 +1390,9 @@
   }
 
   // 按列索引解析（列头走 i18n 翻译，不能依赖 data-label 文案）；
-  // 列顺序与页面一致：0 昵称, 1 队伍, 2 国家或地区, 3 年龄, 4 位置, 5 Major 冠军, 6 Major 次数, 7 状态
+  // 列顺序与页面一致：0 昵称, 1 队伍, 2 国籍, 3 年龄, 4 位置, 5 Major 冠军, 6 Major 次数, 7 状态
+  // 多人面板无独立地区列：国籍 3 级（correct/close/wrong）已折叠地区信息，
+  // close=异国同区、wrong=异国异区，无需再用 regionOptions 保留双编码（旧版会错误保留同区候选）。
   function keyFromRow(row) {
     const cells = row.cells;
     const lv = td => {
@@ -987,25 +1405,23 @@
       if (!td) return 0;
       const cls = String(td.className);
       if (cls.includes('correct')) return 0;
-      if (cls.includes('close')) return 1;
-      return td.querySelector('.dir svg.lucide-arrow-up') ? 2 : 3;
+      const up = td.querySelector('.dir svg.lucide-arrow-up');
+      const close = cls.includes('close');
+      // higher(up): close→1, far→2 ; lower(down): close→3, far→4（与服务端一致）
+      return up ? (close ? 1 : 2) : (close ? 3 : 4);
     };
     const natLv = lv(cells[2]);
-    // 多人反馈不含地区维度：同国(correct)或不同国同地区(close)时地区必相同；
-    // 国籍不同(wrong)时地区未知，两种编码都保留，避免错误排除同地区选手
-    const regionOptions = natLv === 2 ? [0, 2] : [0];
-    return regionOptions.map(region => {
-      let k = 0;
-      k = k * 3 + natLv;
-      k = k * 3 + region;
-      k = k * 3 + lv(cells[1]);
-      k = k * 4 + num(cells[3]);
-      k = k * 3 + lv(cells[4]);
-      k = k * 4 + num(cells[5]);
-      k = k * 4 + num(cells[6]);
-      k = k * 3 + lv(cells[7]);
-      return k;
-    });
+    const nat = natLv === 0 ? 2 : natLv === 1 ? 1 : 0;
+    // id 隔离位：获胜行（row-correct，猜测即答案）=1，否则 0
+    let k = row.classList.contains('row-correct') ? 1 : 0;
+    k = k * 3 + nat;
+    k = k * 2 + (lv(cells[1]) === 0 ? 1 : 0);
+    k = k * 5 + num(cells[3]);
+    k = k * 2 + (lv(cells[4]) === 0 ? 1 : 0);
+    k = k * 5 + num(cells[5]);
+    k = k * 5 + num(cells[6]);
+    k = k * 2 + (lv(cells[7]) === 0 ? 1 : 0);
+    return [k];
   }
 
   function computeMultiFill() {
@@ -1017,76 +1433,37 @@
     }
     // 放水局：不填不猜，等 pollMulti 点「跳过本局」
     if (multi.handicapLose) return;
-    const excluded = new Set([...multi.guessed, ...multi.submitted]);
-    const available = cands.filter(c => !excluded.has(c));
-    let g = available.length
-      ? pickGuess(enc, cands, cands, excluded, 8 - multi.turn)
-      : all.find(c => !excluded.has(c));
+    const h = handicapConfig();
+    // 非控场排除集与原版逐字一致（guessed∪submitted，不含 pending），
+    // 控场排除集额外含 pendingIdx，避免重提未确认的猜测
+    const pendingSet = multi.pendingIdx >= 0 ? [multi.pendingIdx] : [];
+    const excluded = h.enabled
+      ? new Set([...multi.guessed, ...multi.submitted, ...pendingSet])
+      : new Set([...multi.guessed, ...multi.submitted]);
+    let g = decideMultiGuess({
+      enc, all,
+      candidates: cands,
+      excluded,
+      turn: multi.turn,
+      maxGuesses: 8,
+      handicapEnabled: h.enabled,
+      roundMinGuesses: multi.roundMinGuesses,
+      plan: multi.handicapPlan,
+      bestGreens: multi.bestGreens,
+    });
+    if (g === undefined || g < 0) {
+      // 兜底：决策返回无效时退回 solver
+      const available = cands.filter(c => !excluded.has(c));
+      g = available.length ? pickGuess(enc, cands, cands, excluded, 8 - multi.turn)
+        : all.find(c => !excluded.has(c));
+    }
     if (g === undefined || g < 0) {
       setStatus('多人：本局已无未提交选手');
       return;
     }
-    const h = handicapConfig();
-    const remaining = 8 - multi.turn;
-    // 控场探路阶段：最少猜测次数内使用 padding 序列（绝不命中答案）
-    if (h.enabled && multi.turn < multi.roundMinGuesses && remaining > 2) {
-      const guessedAll = new Set([...multi.guessed, ...multi.submitted, ...(multi.pendingIdx >= 0 ? [multi.pendingIdx] : [])]);
-      const paddingLeft = multi.roundMinGuesses - multi.turn;
-      const pg = pickPaddingGuess(cands, guessedAll, paddingLeft);
-      if (pg >= 0) {
-        g = pg;
-      } else {
-        const ref = multi.handicapRefIdx;
-        const fallback = all.find(c => !guessedAll.has(c) && c !== ref);
-        if (fallback !== undefined) g = fallback;
-      }
-    } else if (h.enabled && multi.handicapRefIdx >= 0 && multi.handicapLastLv) {
-      // 控场求解阶段：padding 结束后，solver 的候选也受支配约束，
-      // 保证整局所有行的着色严格渐进（已绿列不退步）。
-      const ref = multi.handicapRefIdx;
-      const curLv = multi.handicapLastLv;
-      const pool = (available.length ? available : all.filter(c => !excluded.has(c)))
-        .filter(c => c !== ref);
-      // tier1: 严格支配（无回退 + 有进步）
-      let dominated = pool.filter(c => {
-        const lv = attrLevels(c, ref);
-        let dom = true, imp = false;
-        for (let i = 0; i < 8; i++) {
-          if (lv[i] > curLv[i]) { dom = false; break; }
-          if (lv[i] < curLv[i]) imp = true;
-        }
-        return dom && imp;
-      });
-      // tier2: 无回退（允许持平）
-      if (!dominated.length) {
-        dominated = pool.filter(c => {
-          const lv = attrLevels(c, ref);
-          for (let i = 0; i < 8; i++) { if (lv[i] > curLv[i]) return false; }
-          return true;
-        });
-      }
-      // tier3: 总距离更小
-      if (!dominated.length) {
-        const curTotal = curLv.reduce((s, v) => s + v, 0);
-        dominated = pool.filter(c => guessDistance(c, ref) < curTotal);
-      }
-      if (dominated.length) {
-        // 从支配候选中选信息量最大的
-        let best = dominated[0], bestInfo = guessInfoGain(best, cands);
-        for (let i = 1; i < dominated.length; i++) {
-          const info = guessInfoGain(dominated[i], cands);
-          if (info > bestInfo) { best = dominated[i]; bestInfo = info; }
-        }
-        g = best;
-      }
-      // tier4: 无支配候选时保持 solver 原始选择
-    }
-    // 更新渐进基线：记录本次猜测相对于参照目标的属性等级
-    if (h.enabled && multi.handicapRefIdx >= 0 && g >= 0 && g !== multi.handicapRefIdx) {
-      multi.handicapLastLv = attrLevels(g, multi.handicapRefIdx);
-    }
     multi.lastIdx = g;
-    renderPanel({ mode: multi.mode, cands: cands.length, total: enc.n, turn: multi.turn, max: 8, nick: enc.nicks[g], exp: 0, statusLine });
+    const hcInfo = h.enabled ? { turn: multi.turn, minG: multi.roundMinGuesses, cands: cands.length } : null;
+    renderPanel({ mode: multi.mode, cands: cands.length, total: enc.n, turn: multi.turn, max: 8, nick: enc.nicks[g], exp: 0, statusLine, handicap: hcInfo, twinLocked: cands.length > 1 && isTwinCluster(cands) });
     if (loadSettings().autoFill) {
       if (!fillMulti(enc.nicks[g])) multi.fillPending = enc.nicks[g];
     }
@@ -1240,6 +1617,9 @@
         }
         multi.guessed.add(gIdx);
         multi.submitted.add(gIdx);
+        // 追踪历史最高绿色格数，用于控场绿色单调性
+        const greens = row.querySelectorAll('td.correct').length;
+        if (greens > multi.bestGreens) multi.bestGreens = greens;
       } else {
         setStatus(`多人：无法识别猜测「${nick}」，请同步数据`);
       }
@@ -1296,7 +1676,7 @@
         if (enc) {
           const ansIdx = enc.nicks.indexOf(multi.lastAnswer);
           if (ansIdx >= 0 && !multi.candidates.includes(ansIdx)) {
-            setStatus(`选手库与服务器不一致（答案「${multi.lastAnswer}」不在候选集），请点「同步选手库」更新`);
+            setStatus(`选手库与服务器不一致（答案「${multi.lastAnswer}」不在候选集），请点「导入 JSON」重新导入与服务器一致的选手库`);
           }
         }
       } else if (!multi.ended) {
@@ -1325,7 +1705,7 @@
         if (enc) {
           const ansIdx = enc.nicks.indexOf(multi.lastAnswer);
           if (ansIdx >= 0 && !multi.candidates.includes(ansIdx)) {
-            setStatus(`选手库与服务器不一致（答案「${multi.lastAnswer}」不在候选集），请点「同步选手库」更新`);
+            setStatus(`选手库与服务器不一致（答案「${multi.lastAnswer}」不在候选集），请点「导入 JSON」重新导入与服务器一致的选手库`);
           }
         }
       }
@@ -1511,6 +1891,11 @@
         /获胜|成功|完成|就绪/.test(text) ? ' ok' : ''
       );
     }
+    // 游戏结束/离开时重置收敛进度条
+    if (/等待|离开|结束/.test(text)) {
+      const convBar = panelRoot.querySelector('#fb-conv-bar');
+      if (convBar) convBar.style.width = '0%';
+    }
   }
 
   function createPanel() {
@@ -1528,6 +1913,8 @@
         .fb-header h1{font-size:13px;font-weight:600;letter-spacing:.3px;color:#f0f2f5}
         .fb-header-right{display:flex;align-items:center;gap:8px}
         .fb-mode{font-size:10px;color:#8b95a5;background:rgba(255,255,255,.05);padding:2px 7px;border-radius:20px}
+        .fb-src{font-size:10px;padding:2px 7px;border-radius:20px;background:rgba(127,180,255,.12);color:#7fb4ff}
+        .fb-src.merged{background:rgba(110,231,160,.12);color:#6ee7a0}
         .fb-collapse{width:20px;height:20px;border:0;background:rgba(255,255,255,.06);color:#8b95a5;border-radius:6px;cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center;transition:background .15s}
         .fb-collapse:hover{background:rgba(255,255,255,.12);color:#fff}
         /* 主体 */
@@ -1535,6 +1922,8 @@
         /* 对局信息 */
         .fb-info{margin-bottom:10px}
         .fb-cand{font-size:11px;color:#7c8698;margin-bottom:2px}
+        .fb-conv{height:3px;border-radius:2px;background:rgba(255,255,255,.06);margin:4px 0 6px;overflow:hidden}
+        .fb-conv-bar{height:100%;border-radius:2px;background:linear-gradient(90deg,#6ee7a0,#34d399);transition:width .4s ease;width:0}
         .fb-guess{font-size:18px;font-weight:700;color:#6ee7a0;letter-spacing:.2px;text-shadow:0 0 12px rgba(110,231,160,.15)}
         .fb-guess.idle{color:#5a6375;font-size:13px;font-weight:400;text-shadow:none}
         /* 开关组 */
@@ -1555,11 +1944,24 @@
         .fb-hc-btns{display:flex;gap:6px;margin-top:8px}
         .fb-hc-btns button{flex:1;padding:5px 0;border-radius:7px;border:0;cursor:pointer;font-size:11px;font-weight:500;color:#fff;transition:filter .15s}
         .fb-hc-btns button:hover{filter:brightness(1.15)}
-        /* 数据操作 */
-        .fb-data{display:flex;gap:6px;margin-bottom:10px}
-        .fb-data button{flex:1;padding:6px 0;border-radius:8px;border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.03);color:#8b95a5;cursor:pointer;font-size:11px;transition:all .18s}
-        .fb-data button:hover{background:rgba(255,255,255,.08);color:#d0d5dd}
-        .fb-data button:disabled{opacity:.4;cursor:default}
+        /* 选手库数据卡片（导入/同步/仓库拉取 + 数据说明 合并） */
+        .fb-libcard{background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:8px 9px;margin-bottom:10px}
+        .fb-lib-head{display:flex;align-items:center;gap:7px;margin-bottom:7px}
+        .fb-lib-title{font-size:11px;font-weight:700;color:#d0d5dd;letter-spacing:.5px}
+        .fb-lib-sum{flex:1;font-size:10px;color:#8b95a5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .fb-lib-toggle{font-size:11px;color:#6b7585;background:none;border:none;cursor:pointer;padding:0 2px;line-height:1;transition:transform .2s}
+        .fb-lib-toggle:hover{color:#d0d5dd}
+        .fb-lib-actions{display:flex;gap:6px}
+        .fb-lib-actions button{flex:1;padding:6px 0;border-radius:8px;border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.03);color:#8b95a5;cursor:pointer;font-size:11px;transition:all .18s}
+        .fb-lib-actions button:hover{background:rgba(255,255,255,.08);color:#d0d5dd}
+        .fb-lib-actions button:disabled{opacity:.4;cursor:default}
+        .fb-lib-actions button#fb-sync{color:#7fb4ff;border-color:rgba(127,180,255,.25)}
+        .fb-lib-actions button#fb-sync:hover{background:rgba(127,180,255,.12);color:#aad4ff}
+        .fb-lib-actions button#fb-sync.syncing{color:#ffb27a;border-color:rgba(255,178,122,.35);animation:fb-pulse 1.1s ease-in-out infinite}
+        .fb-lib-detail{display:none;margin-top:7px}
+        .fb-lib-detail.show{display:block}
+        .fb-lib-detail pre{margin:0;font-size:10px;line-height:1.55;color:#8b95a5;white-space:pre-wrap;word-break:break-all;font-family:inherit}
+        @keyframes fb-pulse{0%,100%{opacity:1}50%{opacity:.55}}
         /* 状态栏 */
         .fb-status-wrap{position:relative;padding-left:10px}
         .fb-status-bar{position:absolute;left:0;top:1px;bottom:1px;width:3px;border-radius:2px;background:#3d4450;transition:background .3s}
@@ -1569,6 +1971,9 @@
         /* 经验 */
         .fb-exp{margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.05);font-size:10px;color:#5f6978}
         .fb-exp ul{margin:3px 0 0;padding-left:12px;list-style:disc}
+        .fb-sync-prog{display:none;height:3px;margin-top:5px;border-radius:2px;background:rgba(255,255,255,.06);overflow:hidden}
+        .fb-sync-prog.show{display:block}
+        .fb-sync-fill{height:100%;width:0;background:linear-gradient(90deg,#7fb4ff,#6ee7a0);transition:width .3s}
         /* 收起态浮标 */
         .fb-dot{width:36px;height:36px;border-radius:50%;background:rgba(15,17,23,.9);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.1);box-shadow:0 4px 16px rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;cursor:pointer;transition:transform .2s,box-shadow .2s;color:#6ee7a0;font-size:14px;font-weight:700}
         .fb-dot:hover{transform:scale(1.1);box-shadow:0 6px 20px rgba(0,0,0,.5)}
@@ -1579,6 +1984,7 @@
         <div class="fb-header" id="fb-drag">
           <h1>弗一把助手</h1>
           <div class="fb-header-right">
+            <span class="fb-src" id="fb-src" title="数据来源">本地</span>
             <span class="fb-mode" id="fb-mode">-</span>
             <button class="fb-collapse" id="fb-min" title="收起">─</button>
           </div>
@@ -1586,6 +1992,7 @@
         <div class="fb-body">
           <div class="fb-info">
             <div class="fb-cand" id="fb-cand">等待对局</div>
+            <div class="fb-conv"><div class="fb-conv-bar" id="fb-conv-bar"></div></div>
             <div class="fb-guess idle" id="fb-guess">─</div>
           </div>
           <div class="fb-toggles">
@@ -1613,13 +2020,25 @@
               </div>
             </div>
           </div>
-          <div class="fb-data">
-            <button id="fb-import">导入 JSON</button>
-            <button id="fb-sync">同步选手库</button>
+          <div class="fb-libcard">
+            <div class="fb-lib-head">
+              <span class="fb-lib-title">选手库</span>
+              <span class="fb-lib-sum" id="fb-lib-sum">无数据</span>
+              <button class="fb-lib-toggle" id="fb-lib-toggle" title="展开/收起数据说明">▾</button>
+            </div>
+            <div class="fb-lib-actions">
+              <button id="fb-import" title="从本地 JSON 文件导入选手">导入 JSON</button>
+              <button id="fb-sync" title="从游戏服务器增量同步选手属性">同步服务器</button>
+              <button id="fb-repo" title="从仓库重新拉取 players_full.json">重试拉取</button>
+            </div>
+            <div class="fb-lib-detail" id="fb-lib-detail">
+              <pre id="fb-lib-detail-text">—</pre>
+            </div>
           </div>
           <div class="fb-status-wrap">
             <div class="fb-status-bar" id="fb-status-bar"></div>
             <div class="fb-status" id="fb-status">就绪</div>
+            <div class="fb-sync-prog" id="fb-sync-prog"><div class="fb-sync-fill" id="fb-sync-fill"></div></div>
           </div>
           <div class="fb-exp" id="fb-exp"></div>
         </div>
@@ -1717,19 +2136,21 @@
     });
     updateHandicapButton();
 
-    // --- 数据操作 ---
+    // --- 选手库数据卡片 ---
     shadow.getElementById('fb-import').addEventListener('click', importFromFile);
-    shadow.getElementById('fb-sync').addEventListener('click', async () => {
-      shadow.getElementById('fb-sync').disabled = true;
-      try {
-        setStatus('正在从 GitHub 数据仓库同步选手库...');
-        const ok = await syncFromGitHub();
-        if (ok) {
-          setStatus(`选手库同步完成（v${cache.version}，${cache.players.length} 人）`);
-        }
-      } finally {
-        shadow.getElementById('fb-sync').disabled = false;
-      }
+    shadow.getElementById('fb-sync').addEventListener('click', () => {
+      if (_syncState && _syncState.running) cancelSync();
+      else syncFromServer();
+    });
+    shadow.getElementById('fb-repo').addEventListener('click', () => {
+      if (!(_syncState && _syncState.running) && !_repoFetching) fetchAndMergeRepo(true);
+    });
+    shadow.getElementById('fb-lib-toggle').addEventListener('click', () => {
+      const det = shadow.getElementById('fb-lib-detail');
+      const tg = shadow.getElementById('fb-lib-toggle');
+      const open = det.classList.toggle('show');
+      tg.textContent = open ? '▴' : '▾';
+      if (open) updateLibSummary();
     });
     setStatus(statusLine);
     return shadow;
@@ -1738,7 +2159,19 @@
   function renderPanel(info) {
     if (!panelRoot) return;
     panelRoot.getElementById('fb-mode').textContent = MODE_NAMES[info.mode] || info.mode || '多人';
-    panelRoot.getElementById('fb-cand').textContent = `候选 ${info.cands}/${info.total} · 已猜 ${info.turn}/${info.max}`;
+    // 控场进度：探路(turn<minG-1) / 逼近(turn==minG-1) / 锁定(候选==1) / 收尾(turn>=minG)
+    let candText = `候选 ${info.cands}/${info.total} · 已猜 ${info.turn}/${info.max}`;
+    if (info.twinLocked) candText += ' · 双胞胎锁死';
+    if (info.handicap) {
+      const { turn, minG, cands } = info.handicap;
+      const phase = cands <= 1 ? '锁定' : turn < minG - 1 ? '探路' : turn < minG ? '逼近' : '收尾';
+      candText += ` · 控场 ${phase} ${turn}/${minG}`;
+    }
+    panelRoot.getElementById('fb-cand').textContent = candText;
+    // 候选收敛进度条：已排除的候选占比（0%→100%）
+    const convPct = info.total > 0 ? Math.round(100 * (1 - info.cands / info.total)) : 0;
+    const convBar = panelRoot.getElementById('fb-conv-bar');
+    if (convBar) convBar.style.width = convPct + '%';
     const g = panelRoot.getElementById('fb-guess');
     if (info.nick) {
       g.textContent = info.nick;
@@ -1775,6 +2208,8 @@
     setStatus(`自动提交已${s.autoSubmit ? '开启' : '关闭'}`);
   });
   GM_registerMenuCommand('导入本地 JSON 数据', importFromFile);
+  GM_registerMenuCommand('同步服务器选手库', () => { if (!(_syncState && _syncState.running)) syncFromServer(); });
+  GM_registerMenuCommand('从仓库拉取选手库', () => { if (!(_syncState && _syncState.running) && !_repoFetching) fetchAndMergeRepo(true); });
   GM_registerMenuCommand('清空积累经验', () => {
     try { GM_setValue(KEY_STATS, { modes: {}, games: [] }); } catch (e) { /* ignore */ }
     setStatus('经验已清空');
@@ -1821,9 +2256,9 @@
     document.addEventListener('submit', trackMultiSubmit, true);
     if (!document.querySelector('#friberg-helper')) createPanel();
     setStatus('就绪；若已有进行中的对局，请点「重新开始」让助手接管');
-    ensureData().then(ok => {
-      if (ok) checkDbUpdate();
-    }).catch(e => setStatus('选手库加载失败：' + e.message));
+    ensureData();
+    updateDataSourceBadge();
+    updateLibSummary();
     // 事件驱动为主（新行/回合结束立即响应），快速轮询兖底
     if (typeof MutationObserver === 'function') {
       boardObserver = new MutationObserver(scheduleSync);
