@@ -5,7 +5,7 @@
 **CS:GO/CS2 选手猜测游戏辅助油猴脚本 — 求解、填入、控场、反检测**
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version: 0.9.1](https://img.shields.io/badge/version-0.9.1-green.svg)
+![Version: 0.9.2](https://img.shields.io/badge/version-0.9.2-green.svg)
 ![Tampermonkey](https://img.shields.io/badge/userscript-Tampermonkey-orange.svg)
 
 </div>

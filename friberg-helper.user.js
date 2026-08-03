@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         弗一把助手
 // @namespace    shnlfriberg.helper
-// @version      0.9.1
+// @version      0.9.2
 // @description  弗一把(CSGO 选手猜测)开源辅助：求解最优猜测并填入输入框，单人与多人联机自动接管，提交与否由你决定；首次自动拉取仓库数据，支持本地 JSON 导入与服务器增量同步
 // @match        https://shnlfriberg.online/*
 // @homepageURL  https://github.com/byJming/friberg-helper
@@ -189,8 +189,8 @@
   }
 
   // 从 top-K 中加权随机选取，避免每步都选最优解触发服务端相似度检测。
-  // 服务端 userGameAnalysis 会计算每步的 entropyPercentile，
-  // 持续 top 1% 会导致 similarityIndex ≥ 90（“high” 等级）。
+  // 作弊分析已委托外部服务（仍接收猜测序列与猜测用时），持续 top 1%
+  // 的机器化选择模式依旧容易被识别。
   // 目标：平均百分位控制在 60~85%，模拟“聪明但非机器”的玩家。
   const TOP_K = 4;
   function pickFromTopK(scored) {
@@ -361,8 +361,9 @@
     return avail[0];
   }
 
-  // 反检测 governor：跨局滚动平均 entropyPercentile，动态调整目标带，
-  // 把服务端 similarityIndex 压在 common 区间。
+  // 反检测 governor：跨局滚动平均 entropyPercentile，动态调整目标带。
+  // 作弊分析已移交外部服务（仍上报猜测序列与用时），保持自然化的
+  // 信息增益分布依旧有效，避免持续选择高增益的机器化模式。
   const _gov = { recent: [] };
   function resetGovernor() { _gov.recent.length = 0; }
   function targetBand() {
@@ -647,6 +648,7 @@
   }
 
   // 提交前延迟（毫秒）—— 人性化「思考时间」模型：
+  // - 区间设为 0~0：不受额外限制，返回 0，实际提交速度等同关闭控场
   // - 开局（turn 0）偏快：人类有现成的开局选手，反应短
   // - 中段随候选数对数增长：候选越多越费思量
   // - 偶发长考（约 12%）：模拟「拿不准、反复权衡」
@@ -654,7 +656,9 @@
   function handicapDelayMs() {
     const h = handicapConfig();
     if (!h.enabled) return 0;
-    const lo = Math.max(1, h.delaySecMin || 3);
+    const lo = Math.max(0, h.delaySecMin || 0);
+    // 0~0 秒 = 不增加额外提交延迟（提交速度等同关闭控场，仅受冷却约束）
+    if (lo === 0 && Math.max(0, h.delaySecMax || 0) === 0) return 0;
     const hi = Math.max(lo + 1, h.delaySecMax || lo + 1);
     const cands = multi.candidates.length;
     const turn = multi.turn;
@@ -696,12 +700,13 @@
   }
 
   // 提交链路参数：按钮需等 React 异步刷新自动补全列表后才可点；
-  // 服务端有 1.5s 猜间隔冷却，重试必须留出余量。
+  // 服务端有 1.5s 猜间隔冷却与猜接口限流（30 次/60s），重试必须留出余量。
   const SUBMIT_RETRY_MS = 60;
   const SUBMIT_WAIT_BUTTON_MAX = 30;
   const SUBMIT_CONFIRM_TIMEOUT = 2500;
   const SUBMIT_ROW_TIMEOUT = 10000;
-  const GUESS_COOLDOWN_MS = 1600;
+  // 冷却必须 > 60s/30 次 = 2s 的限流平均节奏，取 2.1s 留余量
+  const GUESS_COOLDOWN_MS = 2100;
 
   // ---------- 选手库数据 ----------
   // 数据来源：用户本地导入 JSON（仓库 data/players_full.json）。
@@ -2065,7 +2070,7 @@
             <div class="fb-hc-inner">
               <label><span>启用控场</span><input type="checkbox" id="hc-enabled"></label>
               <label><span>最少猜测</span><span class="range-row"><input type="number" id="hc-min-lo" min="1" max="6" step="1"><span>~</span><input type="number" id="hc-min-hi" min="1" max="6" step="1"><span>次</span></span></label>
-              <label><span>提交延迟</span><span class="range-row"><input type="number" id="hc-delay-lo" min="0" max="20" step="1"><span>~</span><input type="number" id="hc-delay-hi" min="0" max="20" step="1"><span>秒</span></span></label>
+              <label title="0~0 秒 = 无额外延迟，提交速度等同关闭控场"><span>提交延迟</span><span class="range-row"><input type="number" id="hc-delay-lo" min="0" max="20" step="1"><span>~</span><input type="number" id="hc-delay-hi" min="0" max="20" step="1"><span>秒</span></span></label>
               <label><span>放水概率</span>
                 <select id="hc-lose">
                   <option value="0">0%</option>
@@ -2194,7 +2199,8 @@
       saveSettings(s);
       updateHandicapButton();
       shadow.getElementById('fb-hc').classList.remove('open');
-      setStatus(`控场已${s.handicap.enabled ? '开启' : '关闭'}（${minLo}~${minHi} 猜 · ${delayLo}~${delayHi}s · 放水 ${Math.round(s.handicap.loseRate * 100)}%）`);
+      const delayNote = (minLo >= 0 && delayLo === 0 && delayHi === 0) ? '（0~0s = 无额外延迟）' : '';
+      setStatus(`控场已${s.handicap.enabled ? '开启' : '关闭'}（${minLo}~${minHi} 猜 · ${delayLo}~${delayHi}s${delayNote} · 放水 ${Math.round(s.handicap.loseRate * 100)}%）`);
     });
     updateHandicapButton();
 
