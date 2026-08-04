@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         弗一把助手
 // @namespace    shnlfriberg.helper
-// @version      0.9.2
+// @version      0.10.0
 // @description  弗一把(CSGO 选手猜测)开源辅助：求解最优猜测并填入输入框，单人与多人联机自动接管，提交与否由你决定；首次自动拉取仓库数据，支持本地 JSON 导入与服务器增量同步
 // @match        https://shnlfriberg.online/*
 // @homepageURL  https://github.com/byJming/friberg-helper
@@ -109,6 +109,7 @@
       nats: new Array(players.length),
       regs: new Array(players.length),
       teams: new Array(players.length),
+      ths: new Array(players.length),
       ages: new Array(players.length),
       roles: new Array(players.length),
       mcs: new Array(players.length),
@@ -120,6 +121,13 @@
       enc.nats[i] = code(natMap, p.nationality);
       enc.regs[i] = code(regMap, p.region);
       enc.teams[i] = code(teamMap, p.team);
+      // 历史队伍编码（与当前队伍共用 teamMap）；过滤空项保证 '' 永不入集
+      enc.ths[i] = new Set(
+        (Array.isArray(p.teamHistory) ? p.teamHistory : [])
+          .filter(t => typeof t === 'string' && t.trim())
+          .slice(0, 50)
+          .map(t => code(teamMap, t.trim()))
+      );
       enc.ages[i] = p.age;
       enc.roles[i] = code(roleMap, p.role);
       enc.mcs[i] = p.majorChampionships;
@@ -137,15 +145,23 @@
     const close = Math.abs(gv - tv) <= closeRange;
     return tv > gv ? (close ? 1 : 2) : (close ? 3 : 4);
   }
+  // 队伍反馈 3 级（与服务端 teamAttr 一致）：同队=2(correct)；当前队伍不同但
+  // 猜测队伍在答案选手历史队伍中=1(close)；否则=0(wrong)。
+  function teamLevel(enc, g, a) {
+    if (enc.teams[g] === enc.teams[a]) return 2;
+    return enc.ths[a].has(enc.teams[g]) ? 1 : 0;
+  }
+
   // 逐属性反馈分区键 —— 与服务端 feedbackSignature 逐字等价：
   // ① id 隔离位（猜测即答案时单独成区，匹配服务端最优增益基准）；
   // ② 国籍 3 级折叠地区（同国/异国同区/异国异区），多人面板无独立地区列亦能正确分区；
-  // ③ 数值 5 级含方向。分区等价 ⇒ 内部信息增益/百分位计算与服务端一致，governor 可真实控场。
+  // ③ 队伍 3 级（同队/前队友/无关），历史队伍缺失时自然退化为 0/2 两级；
+  // ④ 数值 5 级含方向。分区等价 ⇒ 内部信息增益/百分位计算与服务端一致，governor 可真实控场。
   function feedbackKey(enc, g, a) {
     let k = g === a ? 1 : 0; // id 隔离位
     const nat = enc.nats[g] === enc.nats[a] ? 2 : enc.regs[g] === enc.regs[a] ? 1 : 0;
     k = k * 3 + nat;
-    k = k * 2 + (enc.teams[g] === enc.teams[a] ? 1 : 0);
+    k = k * 3 + teamLevel(enc, g, a);
     k = k * 5 + numLevel(enc.ages[g], enc.ages[a], AGE_CLOSE);
     k = k * 2 + (enc.roles[g] === enc.roles[a] ? 1 : 0);
     k = k * 5 + numLevel(enc.mcs[g], enc.mcs[a], MAJOR_CLOSE);
@@ -161,17 +177,26 @@
     const close = f.level === 'close';
     return f.hint === 'higher' ? (close ? 1 : 2) : (close ? 3 : 4);
   }
-  function feedbackKeyFromServer(attrs) {
-    let k = 0; // id 隔离位：未猜中时恒 0
-    const nat = attrs.nationality.level === 'correct' ? 2 : attrs.nationality.level === 'close' ? 1 : 0;
-    k = k * 3 + nat; // 地区信息已折叠进国籍 3 级，无需单独编码 region
-    k = k * 2 + (attrs.team.level === 'correct' ? 1 : 0);
-    k = k * 5 + numLevelFromAttr(attrs.age);
-    k = k * 2 + (attrs.role.level === 'correct' ? 1 : 0);
-    k = k * 5 + numLevelFromAttr(attrs.majorChampionships);
-    k = k * 5 + numLevelFromAttr(attrs.majorAppearances);
-    k = k * 2 + (attrs.isActive.level === 'correct' ? 1 : 0);
-    return k;
+  // 从服务端反馈构造分区键集合（单人对局）。仅在未猜中（game 继续）时调用，id 隔离位恒 0。
+  // close（前队友）时本地历史可能缺失，无法断定答案落在 1 还是 0 桶，
+  // 返回双键保留两桶，避免误排除答案（wrong 则必为 0 桶）。
+  function feedbackKeysFromServer(attrs) {
+    const build = (teamDigit) => {
+      let k = 0; // id 隔离位：未猜中时恒 0
+      const nat = attrs.nationality.level === 'correct' ? 2 : attrs.nationality.level === 'close' ? 1 : 0;
+      k = k * 3 + nat; // 地区信息已折叠进国籍 3 级，无需单独编码 region
+      k = k * 3 + teamDigit;
+      k = k * 5 + numLevelFromAttr(attrs.age);
+      k = k * 2 + (attrs.role.level === 'correct' ? 1 : 0);
+      k = k * 5 + numLevelFromAttr(attrs.majorChampionships);
+      k = k * 5 + numLevelFromAttr(attrs.majorAppearances);
+      k = k * 2 + (attrs.isActive.level === 'correct' ? 1 : 0);
+      return k;
+    };
+    const lvl = attrs.team.level;
+    if (lvl === 'correct') return [build(2)];
+    if (lvl === 'close') return [build(1), build(0)];
+    return [build(0)];
   }
 
   function filterCandidates(enc, candidates, gIdx, keys) {
@@ -270,6 +295,7 @@
     candidates: [],
     guessed: new Set(),
     lastIdx: -1,
+    pendingHistory: [], // 本局已收到的 close 队伍证据（待答案揭示后归档）
   };
   const multi = {
     active: false,
@@ -287,6 +313,7 @@
     handicapLose: false,
     handicapSkipDone: false,
     handicapPlan: null,
+    roundCloseTeams: [], // 本回合队伍黄格证据（待回合答案揭示后归档）
     bestGreens: 0,
     roundMinGuesses: 0,
     awaitingRow: false,
@@ -304,12 +331,13 @@
 
   // 计算选手 a 相对于选手 b 的逐属性反馈等级向量（精确复刻服务端着色）。
   // 返回 8 元素数组，每元素 0=green, 1=yellow(close), 2=red(wrong)。
+  // 队伍黄：当前队伍不同但 a 的队伍在 b 的历史队伍中（服务端 teamAttr 语义）。
   // 列顺序与 UI 一致：国籍, 地区, 队伍, 年龄, 位置, Major冠军, Major次数, 状态
   function attrLevels(a, b) {
     const lv = [];
     lv.push(enc.nats[a] === enc.nats[b] ? 0 : enc.regs[a] === enc.regs[b] ? 1 : 2);
     lv.push(enc.regs[a] === enc.regs[b] ? 0 : 2);
-    lv.push(enc.teams[a] === enc.teams[b] ? 0 : 2);
+    lv.push(enc.teams[a] === enc.teams[b] ? 0 : enc.ths[b].has(enc.teams[a]) ? 1 : 2);
     const ageD = Math.abs(enc.ages[a] - enc.ages[b]);
     lv.push(ageD === 0 ? 0 : ageD <= AGE_CLOSE ? 1 : 2);
     lv.push(enc.roles[a] === enc.roles[b] ? 0 : 2);
@@ -730,6 +758,7 @@
     multi.nextSubmitAt = 0;
     multi.handicapPlan = newHandicapPlan();
     multi.bestGreens = 0;
+    multi.roundCloseTeams = [];
     rollHandicapLose();
   }
 
@@ -785,6 +814,12 @@
         idxByNick.set(sp.nickname, local.length);
         local.push(sp); sm[sp.nickname] = incomingSource; added++;
       } else if (incPrio >= (SOURCE_PRIO[existing] || 0)) {
+        // 公开 API 不返回 team_history；incoming 无历史时保留本地已学习的历史，
+        // 避免增量同步/仓库拉取把对局积累的 evidence 覆盖清空。
+        const ex = local[idxByNick.get(sp.nickname)];
+        if ((!Array.isArray(sp.teamHistory) || !sp.teamHistory.length) && ex && ex.teamHistory && ex.teamHistory.length) {
+          sp.teamHistory = ex.teamHistory.slice();
+        }
         local[idxByNick.get(sp.nickname)] = sp; sm[sp.nickname] = incomingSource; replaced++;
       }
     }
@@ -825,6 +860,15 @@
 
   // ---------- 导入本地 JSON ----------
   // 兼容两种格式：脚本内部格式（camelCase + 可选 id）与 csgo-major-db 数据仓库格式（snake_case、无 id）
+  // 历史队伍归一化（与上游 normalizeTeamHistory 一致）：字符串数组、逐项 trim、≤64 字符、≤50 项
+  function normalizeTeamHistory(v) {
+    return (Array.isArray(v) ? v : [])
+      .filter(t => typeof t === 'string')
+      .map(t => t.trim())
+      .filter(t => t && t.length <= 64)
+      .slice(0, 50);
+  }
+
   function normalizePlayerFields(raw) {
     const p = raw && typeof raw === 'object' ? raw : {};
     return {
@@ -833,6 +877,7 @@
       nationality: p.nationality,
       region: p.region,
       team: p.team,
+      teamHistory: normalizeTeamHistory(p.teamHistory !== undefined ? p.teamHistory : p.team_history),
       age: p.age,
       role: p.role,
       majorChampionships: p.majorChampionships !== undefined ? p.majorChampionships : p.major_championships,
@@ -1288,6 +1333,28 @@
     return m;
   }
 
+  // 历史队伍对局积累：服务端 close 反馈 ⇒ 猜测队伍 ∈ 答案选手历史队伍。
+  // 只追加（去重、≤50 项、与当前队伍同名的不入历史），落盘后下次对局重建 enc 生效。
+  function learnTeamHistory(answerNick, teams) {
+    if (!answerNick || !teams || !teams.length || !cache || !cache.players) return;
+    const p = cache.players.find(x => x.nickname === answerNick);
+    if (!p) return;
+    const hist = Array.isArray(p.teamHistory) ? p.teamHistory.slice() : [];
+    const known = new Set(hist);
+    let changed = false;
+    for (const t of teams) {
+      const name = String(t || '').trim();
+      if (!name || name.length > 64 || name === p.team || known.has(name)) continue;
+      if (hist.length >= 50) break;
+      hist.push(name);
+      known.add(name);
+      changed = true;
+    }
+    if (!changed) return;
+    p.teamHistory = hist;
+    savePlayersCache(cache);
+  }
+
   // ---------- 对局逻辑 ----------
   function startGame(data) {
     ensureEncoded();
@@ -1297,6 +1364,7 @@
     state.turn = 0;
     state.guessed = new Set();
     state.lastIdx = -1;
+    state.pendingHistory = [];
     state.candidates = all.slice();
     if (enc) computeAndFill();
   }
@@ -1331,6 +1399,7 @@
             nationality: a.nationality.value,
             region: a.region.value,
             team: a.team.value,
+            teamHistory: [],
             age: a.age.value,
             role: a.role.value,
             majorChampionships: a.majorChampionships.value,
@@ -1344,15 +1413,19 @@
         }
       }
     }
+    // 历史队伍证据：close = 猜测队伍 ∈ 答案历史队伍，待终局答案揭示后归档
+    if (!fb.correct && fb.attributes && fb.attributes.team.level === 'close' && fb.attributes.team.value) {
+      state.pendingHistory.push(fb.attributes.team.value);
+    }
     if (fb.correct) {
       endGame(true, data.guessCount, data.answer && data.answer.nickname);
       return;
     }
-    const key = feedbackKeyFromServer(fb.attributes);
+    const keys = feedbackKeysFromServer(fb.attributes);
     // 选手库来自数据仓库（无服务器 id），用昵称映射反馈
     const gIdx = fb.nickname ? enc.nicks.indexOf(fb.nickname) : -1;
     if (gIdx >= 0) {
-      state.candidates = filterCandidates(enc, state.candidates, gIdx, key);
+      state.candidates = filterCandidates(enc, state.candidates, gIdx, keys);
       state.guessed.add(gIdx);
     } else {
       setStatus('警告：服务器选手与本地库不一致，请同步数据');
@@ -1365,13 +1438,17 @@
     if (!state.inGame) return;
     if (data.answer) {
       recordGame(state.mode, false, state.turn, data.answer.nickname);
+      learnTeamHistory(data.answer.nickname, state.pendingHistory);
       setStatus(`本局答案：${data.answer.nickname}（已记录）`);
     }
+    state.pendingHistory = [];
     state.inGame = false;
   }
 
   function endGame(won, guesses, answerNick) {
     const m = recordGame(state.mode, won, guesses, answerNick);
+    learnTeamHistory(answerNick, state.pendingHistory);
+    state.pendingHistory = [];
     setStatus(
       `本局${won ? '获胜' : '结束'}（${guesses} 步）· 该难度战绩 ${m.wins}/${m.games} 胜率 ${m.games ? Math.round(100 * m.wins / m.games) : 0}% 平均 ${m.games ? (m.guesses / m.games).toFixed(1) : '-'} 步`
     );
@@ -1460,6 +1537,7 @@
   // 列顺序与页面一致：0 昵称, 1 队伍, 2 国籍, 3 年龄, 4 位置, 5 Major 冠军, 6 Major 次数, 7 状态
   // 多人面板无独立地区列：国籍 3 级（correct/close/wrong）已折叠地区信息，
   // close=异国同区、wrong=异国异区，无需再用 regionOptions 保留双编码（旧版会错误保留同区候选）。
+  // 队伍同为 3 级：黄=前队友；本地历史可能缺失，黄格时返回双键保留两桶避免误排除。
   function keyFromRow(row) {
     const cells = row.cells;
     const lv = td => {
@@ -1480,15 +1558,21 @@
     const natLv = lv(cells[2]);
     const nat = natLv === 0 ? 2 : natLv === 1 ? 1 : 0;
     // id 隔离位：获胜行（row-correct，猜测即答案）=1，否则 0
-    let k = row.classList.contains('row-correct') ? 1 : 0;
-    k = k * 3 + nat;
-    k = k * 2 + (lv(cells[1]) === 0 ? 1 : 0);
-    k = k * 5 + num(cells[3]);
-    k = k * 2 + (lv(cells[4]) === 0 ? 1 : 0);
-    k = k * 5 + num(cells[5]);
-    k = k * 5 + num(cells[6]);
-    k = k * 2 + (lv(cells[7]) === 0 ? 1 : 0);
-    return [k];
+    const base = row.classList.contains('row-correct') ? 1 : 0;
+    const build = (teamDigit) => {
+      let k = base;
+      k = k * 3 + nat;
+      k = k * 3 + teamDigit;
+      k = k * 5 + num(cells[3]);
+      k = k * 2 + (lv(cells[4]) === 0 ? 1 : 0);
+      k = k * 5 + num(cells[5]);
+      k = k * 5 + num(cells[6]);
+      k = k * 2 + (lv(cells[7]) === 0 ? 1 : 0);
+      return k;
+    };
+    const teamLv = lv(cells[1]);
+    if (teamLv === 1) return [build(1), build(0)];
+    return [build(teamLv === 0 ? 2 : 0)];
   }
 
   function computeMultiFill() {
@@ -1673,6 +1757,12 @@
       const nickEl = row.querySelector('td.name');
       const nick = nickEl ? nickEl.textContent.trim() : '';
       if (!nick) break; // React 可能先插入空行，再补齐单元格内容
+      // 历史队伍证据：队伍列黄格 ⇒ 猜测队伍 ∈ 答案历史队伍，待回合答案揭示后归档
+      const teamTd = row.cells ? row.cells[1] : null;
+      if (teamTd && String(teamTd.className).includes('close')) {
+        const tt = teamTd.textContent.trim();
+        if (tt) multi.roundCloseTeams.push(tt);
+      }
       const gIdx = enc ? enc.nicks.indexOf(nick) : -1;
       if (gIdx >= 0) {
         const filtered = filterCandidates(enc, multi.candidates, gIdx, keyFromRow(row));
@@ -1737,6 +1827,7 @@
       setStatus(`多人对局（${MODE_NAMES[multi.mode] || '?'}）已接管`);
       if (roundEnded) {
         multi.lastAnswer = answerText;
+        learnTeamHistory(answerText, multi.roundCloseTeams);
         const won = multiLastRowWon(selfBoard);
         recordGame(multi.mode || 'normal', won, multi.turn, multi.lastAnswer);
         setStatus(`多人${won ? '获胜' : '失利'}：答案 ${multi.lastAnswer}（已记录）`);
@@ -1765,6 +1856,7 @@
       multi.autoSubmit.pending = false;
       if (multi.lastAnswer !== answerText) {
         multi.lastAnswer = answerText;
+        learnTeamHistory(answerText, multi.roundCloseTeams);
         const won = multiLastRowWon(selfBoard);
         recordGame(multi.mode || 'normal', won, multi.turn, multi.lastAnswer);
         setStatus(`多人${won ? '获胜' : '失利'}：答案 ${multi.lastAnswer}（已记录）`);

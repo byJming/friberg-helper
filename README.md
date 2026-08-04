@@ -5,7 +5,7 @@
 **CS:GO/CS2 选手猜测游戏辅助油猴脚本 — 求解、填入、控场、反检测**
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version: 0.9.2](https://img.shields.io/badge/version-0.9.2-green.svg)
+![Version: 0.10.0](https://img.shields.io/badge/version-0.10.0-green.svg)
 ![Tampermonkey](https://img.shields.io/badge/userscript-Tampermonkey-orange.svg)
 
 </div>
@@ -53,6 +53,7 @@
       "nationality": "...",
       "region": "...",
       "team": "...",
+      "team_history": [],
       "age": 0,
       "role": "...",
       "major_championships": 0,
@@ -63,7 +64,7 @@
 }
 ```
 
-脚本兼容 camelCase 与 snake_case 两种字段格式。`version` 为可选字段，用于版本追踪。
+脚本兼容 camelCase 与 snake_case 两种字段格式。`version` 为可选字段，用于版本追踪。`team_history` 为可选字符串数组（每项 ≤64 字符、≤50 项）：猜测队伍在答案选手历史队伍中时服务端反馈黄格；缺失时脚本会在对局中自动积累并落盘。
 
 ## 项目结构
 
