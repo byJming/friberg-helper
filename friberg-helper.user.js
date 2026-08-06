@@ -320,6 +320,7 @@
     bestGreens: 0,
     roundMinGuesses: 0,
     afkPending: false,  // 本回合 AFK 长停顿配额（触发时机在延迟模型里掷）
+    choked: false,      // 上头局：关闭败局救援，允许真实的手数耗尽败局
     lastGreens: 0,      // 最近一手反馈绿格数（延迟模型的反馈耦合输入）
     confusedLeft: 0,    // 困惑状态剩余手数（成簇错误：人类失误是相关的）
     afkDone: false,     // 本回合是否已插入 AFK 级停顿
@@ -596,10 +597,15 @@
 
   // 直觉猜测：真人凭印象/偏好冲一手——同国籍、同队、惯用开局等锚点选手。
   // 刻意不追求信息增益且容忍绿格回退：零回退是强机器指纹，人类试探性猜测常让面板变差。
+  // 上头局特例：直觉忽略面板锚点、只跟个人偏见（流行度/偏好地区/惯用开局），
+  // 猜测与答案属性解耦 ⇒ 候选集压不下来，自然滑向手数耗尽的真实败局。
   function pickIntuitionGuess(cands, excluded) {
     const p = loadPersona();
-    const proxy = modalCandidate(cands, excluded);
-    const pool = all.filter(c => !excluded.has(c) && c !== proxy);
+    // 上头局全程忽略面板锚点（含收尾阶段），只跟个人偏见走
+    const proxy = multi.choked ? -1 : modalCandidate(cands, excluded);
+    // 上头局额外排除候选集内选手：偏见猜测与答案解耦，不会意外命中/收窄候选，
+    // 使上头局大概率以手数耗尽自然收场（真上头的人大多真的输）
+    const pool = all.filter(c => !excluded.has(c) && c !== proxy && (!multi.choked || !cands.includes(c)));
     if (!pool.length) return -1;
     const scored = pool.map(c => {
       let s = playerPopularity(c);
@@ -659,8 +665,9 @@
       multi.confusedLeft--;
       return pickIntuitionGuess(cands, excluded);
     }
-    // 偶发直觉手：非困惑期小概率冲动猜测，打破「每手信息增益都在目标带内」的机器不变量
-    if (!confirmed && turn > 0 && turn < minG && Math.random() < p.regressRate) {
+    // 偶发直觉手：非困惑期小概率冲动猜测，打破「每手信息增益都在目标带内」的机器不变量；
+    // 上头局频率提升——真人在不顺的局里更依赖直觉而非理性分析
+    if (!confirmed && turn > 0 && turn < minG && Math.random() < p.regressRate * (multi.choked ? 3 : 1)) {
       return pickIntuitionGuess(cands, excluded);
     }
 
@@ -676,16 +683,22 @@
       if (minG - turn > 2 && Math.random() < 0.45) return cands[0];
       return pickNearMiss(cands[0], excluded, bestGreens, minG - turn);
     }
-    // 已过目标窗口：正常求解（允许获胜）；确认则提交
+    // 已过目标窗口：正常求解（允许获胜）；确认则提交。
+    // 上头局：候选压到 ≤2 后不枚举收尾，改猜候选集外的偏见选手（真人死钻牛角尖就是不猜那两个），
+    // 剩余回合自然耗尽成真实败局；候选仍多时候选内低效求解，不借全局池极限翻盘。
     if (turn >= minG) {
       if (confirmed) return cands[0];
-      // 候选数 > 剩余步数时无法逐一枚举，用全局池求解以最大化信息增益（仅拟真模式）
-      const solvePool = cands.length > remaining ? all : cands;
+      if (multi.choked && cands.length <= 2) return pickIntuitionGuess(cands, excluded);
+      // 候选数 > 剩余步数时无法逐一枚举，用全局池求解以最大化信息增益（仅拟真模式且非上头）
+      const solvePool = (!multi.choked && cands.length > remaining) ? all : cands;
       return pickGuess(enc, cands, solvePool, excluded, remaining);
     }
     // 探路/逼近阶段（turn < minG, candidates>1）
     const blockWin = turn < lastSolveTurn;
     if (blockWin) {
+      // 上头局：探路期完全凭直觉（真人上头时头铁追猜想，不理性拆分候选集），
+      // 浪费的分裂机会使后期候选数压不下来，自然滑向手数耗尽
+      if (multi.choked) return pickIntuitionGuess(cands, excluded);
       // 禁胜窗口：只从候选集外选，保证绝不提前命中答案（winTurn 必 ≥ minG）。
       // 候选集外的猜测仍能按属性匹配给答案上色（绿/黄），面板自然变绿，且对候选集有信息增益。
       return pickNaturalGuess({ cands, excluded, turn, outsideOnly: true, modalAns: -1, bestGreens, remaining });
@@ -697,8 +710,8 @@
       if (m >= 0) return m;
     }
     // 败局警戒：候选数 > 剩余步数时，自然猜测的信息增益不足以保证获胜，
-    // 切换到 minimax 全局池求解（仅拟真模式，不影响等价性）
-    if (cands.length > remaining) {
+    // 切换到 minimax 全局池求解（仅拟真模式且非上头；上头局继续自然逼近，允许真实败局）
+    if (!multi.choked && cands.length > remaining) {
       return pickGuess(enc, cands, all, excluded, remaining);
     }
     return pickNaturalGuess({ cands, excluded, turn, outsideOnly: false, modalAns: -1, bestGreens, remaining });
@@ -730,6 +743,7 @@
         pace: 0.85 + Math.random() * 0.4,            // 个人节奏系数
         regressRate: 0.05 + Math.random() * 0.07,    // 直觉手/绿格回退概率
         confusionRate: 0.08 + Math.random() * 0.08,  // 本回合进入困惑（成簇错误）概率
+        chokeRate: 0.05 + Math.random() * 0.06,      // 本回合上头（自然败局）概率
         afkRate: 0.05 + Math.random() * 0.06,        // 本回合出现 AFK 级停顿概率
         openers: [],                                  // 惯用开局昵称（选手库就绪后惰性生成）
         favReg: -1,                                   // 偏好地区编码
@@ -785,12 +799,12 @@
     ensurePersonaTraits();
     _sess.rounds += 1;
     // 放水聚簇：人类状态有惯性（连败/手感热），均匀伯努利放水是采样器指纹。
-    //  momentum>0（近期输过）⇒ 更易继续输；刚赢 ⇒ 放水概率打折，输局自然成串出现。
+    // 动量只小幅放大且封顶：制造 2~3 连败的短串而非失控长连败，避免整体胜率偏离合理区间。
     let lose = false;
     if (h.enabled && h.loseRate > 0) {
       const rate = _sess.loseMomentum > 0
-        ? Math.min(0.6, h.loseRate * (1.2 + 0.4 * _sess.loseMomentum))
-        : h.loseRate * 0.7;
+        ? Math.min(0.3, h.loseRate * (1 + 0.25 * Math.min(2, _sess.loseMomentum)))
+        : h.loseRate * 0.75;
       lose = Math.random() < rate;
     }
     _sess.loseMomentum = lose ? _sess.loseMomentum + 1 : Math.max(0, _sess.loseMomentum - 1);
@@ -800,6 +814,9 @@
     // 困惑状态：触发后连续 2~3 手成簇变差；放水局不困惑（直接跳过）
     multi.confusedLeft = (h.enabled && !lose && Math.random() < p.confusionRate)
       ? 2 + Math.floor(Math.random() * 2) : 0;
+    // 上头局：禁用败局救援 + 直觉手频率提升，产生真实的 8 手耗尽败局。
+    // 「不弃局则必胜」的条件分布是强机器指纹，败局必须来自真实猜不出而非只靠跳过。
+    multi.choked = h.enabled && !lose && Math.random() < p.chokeRate;
     // AFK 配额：整回合至多一次长停顿，触发时机在延迟模型里掷
     multi.afkPending = h.enabled && !lose && Math.random() < p.afkRate;
     multi.afkDone = false;
