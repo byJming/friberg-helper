@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         弗一把助手
 // @namespace    shnlfriberg.helper
-// @version      0.11.0
+// @version      0.12.0
 // @description  弗一把(CSGO 选手猜测)开源辅助：求解最优猜测并填入输入框，单人与多人联机自动接管，提交与否由你决定；首次自动拉取仓库数据，支持本地 JSON 导入与服务器增量同步
 // @match        https://shnlfriberg.online/*
 // @homepageURL  https://github.com/byJming/friberg-helper
@@ -36,6 +36,9 @@
   const AGE_CLOSE = 3;
   const MAJOR_CLOSE = 1;
   const MODE_NAMES = { beginner: '入门版', easy: '简单版', normal: '完整版' };
+  const MODE_KEYS = new Set(Object.keys(MODE_NAMES));
+  // 难度标签覆盖率过低时不强行切池，避免旧缓存/部分同步误排除真实答案。
+  const MODE_POOL_MIN_COVERAGE = 0.8;
 
   // ---------- 存储（带内存缓存，避免热路径反复读 GM 存储） ----------
   let _statsCache = null;
@@ -81,6 +84,15 @@
         delete h.minGuessesMin; delete h.minGuessesMax;
         if (!h.strategy) h.strategy = 'balanced';
       }
+      // 对旧版本/手动改写的配置做一次边界归一化，避免非法值污染延迟与概率模型。
+      const h = s.handicap;
+      h.enabled = Boolean(h.enabled);
+      h.strategy = ['conservative', 'balanced', 'aggressive'].includes(h.strategy) ? h.strategy : HANDICAP_DEFAULT.strategy;
+      const toSec = value => Number.isFinite(Number(value)) ? Math.min(60, Math.max(0, Math.floor(Number(value)))) : 0;
+      h.delaySecMin = toSec(h.delaySecMin);
+      h.delaySecMax = Math.max(h.delaySecMin, toSec(h.delaySecMax));
+      const lose = Number(h.loseRate);
+      h.loseRate = Number.isFinite(lose) ? Math.min(0.4, Math.max(0, lose)) : HANDICAP_DEFAULT.loseRate;
       _settingsCache = s;
       return s;
     } catch (e) { _settingsCache = { autoFill: true, autoSubmit: false, handicap: { ...HANDICAP_DEFAULT } }; return _settingsCache; }
@@ -299,6 +311,11 @@
     guessed: new Set(),
     lastIdx: -1,
     pendingHistory: [], // 本局已收到的 close 队伍证据（待答案揭示后归档）
+    roundMinGuesses: 0,
+    bestGreens: 0,
+    confusedLeft: 0,
+    choked: false,
+    chokeStrength: 0,
   };
   const multi = {
     active: false,
@@ -320,11 +337,14 @@
     bestGreens: 0,
     roundMinGuesses: 0,
     afkPending: false,  // 本回合 AFK 长停顿配额（触发时机在延迟模型里掷）
-    choked: false,      // 上头局：关闭败局救援，允许真实的手数耗尽败局
+    choked: false,      // 上头局：提高直觉偏置，但保留概率性恢复与收尾
     lastGreens: 0,      // 最近一手反馈绿格数（延迟模型的反馈耦合输入）
     confusedLeft: 0,    // 困惑状态剩余手数（成簇错误：人类失误是相关的）
     afkDone: false,     // 本回合是否已插入 AFK 级停顿
     rhythm: [],         // 最近几手提交延迟（秒），用于连击后犹豫的节奏建模
+    chokeStrength: 0,   // 上头强度：用概率偏向替代“永不猜候选”的硬规则
+    giveUpAfter: 0,     // 计划放弃时先尝试的手数，避免零猜测瞬时跳过
+    roundStartedAt: 0,  // 本地回合起点，用于思考时间预算
     awaitingRow: false,
     awaitingRowAt: 0,
     pendingIdx: -1,
@@ -404,14 +424,22 @@
   const _gov = { recent: [] };
   function resetGovernor() { _gov.recent.length = 0; }
   function targetBand() {
+    const p = loadPersona();
     const arr = _gov.recent;
-    if (arr.length < 4) return { lo: 0.35, hi: 0.85 };
-    let mean = 0; for (const v of arr) mean += v; mean /= arr.length;
-    // 动态收紧：均值偏高时压低上界，均值偏低时抬高下界
-    if (mean > 0.78) return { lo: 0.2, hi: 0.48 };
-    if (mean < 0.45) return { lo: 0.62, hi: 0.92 };
-    if (mean > 0.68) return { lo: 0.28, hi: 0.62 };
-    return { lo: 0.35, hi: 0.8 };
+    const target = p.entropyTarget;
+    const spread = p.entropySpread;
+    if (arr.length < 4) return { lo: Math.max(0.12, target - spread), hi: Math.min(0.96, target + spread) };
+    // 近期样本使用指数权重，控制量连续变化，不再跨越固定阈值后瞬间切换整段区间。
+    let weight = 1, totalWeight = 0, weighted = 0;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      weighted += arr[i] * weight;
+      totalWeight += weight;
+      weight *= 0.92;
+    }
+    const mean = weighted / totalWeight;
+    const correction = Math.max(-0.16, Math.min(0.16, (target - mean) * 0.7));
+    const center = target + correction;
+    return { lo: Math.max(0.08, center - spread), hi: Math.min(0.97, center + spread) };
   }
   function recordPercentile(p) { _gov.recent.push(p); if (_gov.recent.length > 40) _gov.recent.shift(); }
 
@@ -597,15 +625,17 @@
 
   // 直觉猜测：真人凭印象/偏好冲一手——同国籍、同队、惯用开局等锚点选手。
   // 刻意不追求信息增益且容忍绿格回退：零回退是强机器指纹，人类试探性猜测常让面板变差。
-  // 上头局特例：直觉忽略面板锚点、只跟个人偏见（流行度/偏好地区/惯用开局），
-  // 猜测与答案属性解耦 ⇒ 候选集压不下来，自然滑向手数耗尽的真实败局。
-  function pickIntuitionGuess(cands, excluded) {
+  // 上头时偏好流行度/地区/惯用开局，但仍以低概率回到当前候选。
+  function pickIntuitionGuess(cands, excluded, runtime) {
     const p = loadPersona();
-    // 上头局全程忽略面板锚点（含收尾阶段），只跟个人偏见走
-    const proxy = multi.choked ? -1 : modalCandidate(cands, excluded);
-    // 上头局额外排除候选集内选手：偏见猜测与答案解耦，不会意外命中/收窄候选，
-    // 使上头局大概率以手数耗尽自然收场（真上头的人大多真的输）
-    const pool = all.filter(c => !excluded.has(c) && c !== proxy && (!multi.choked || !cands.includes(c)));
+    const active = runtime || multi;
+    const choked = Boolean(active.choked);
+    // 上头不等于永不读面板。对小候选集保留少量重试概率，避免“候选集内猜中概率恒为 0”的硬指纹。
+    const retryCandidate = choked && Math.random() < Math.max(0.12, 0.38 - (active.chokeStrength || 0) * 0.2);
+    const proxy = choked ? -1 : modalCandidate(cands, excluded);
+    let pool = all.filter(c => !excluded.has(c) && c !== proxy && (!choked || retryCandidate || !cands.includes(c)));
+    // normal 难度开局时 cands 就是 all；此时回退到低权重的候选内直觉猜，不让外层 solver 绕过上头状态。
+    if (!pool.length) pool = all.filter(c => !excluded.has(c) && c !== proxy);
     if (!pool.length) return -1;
     const scored = pool.map(c => {
       let s = playerPopularity(c);
@@ -615,6 +645,7 @@
         else if (enc.ths[proxy] && enc.ths[proxy].has(enc.teams[c])) s += 6;
         if (Math.abs(enc.ages[c] - enc.ages[proxy]) <= AGE_CLOSE) s += 3;
       }
+      if (choked && cands.includes(c)) s *= retryCandidate ? 0.75 : 0.28;
       if (p.favReg >= 0 && enc.regs[c] === p.favReg) s += 4;
       if (p.openers.includes(enc.nicks[c])) s += 8;
       return { c, s };
@@ -627,9 +658,9 @@
     return top[top.length - 1].c;
   }
 
-  // 拟真决策主入口（传入状态返回猜测索引；运行中会读写 multi 拟真态：困惑计数/目标延长）。
+  // 单人/多人共用的拟真决策入口。runtime 持有困惑计数、上头强度与自适应目标。
   // 非拟真模式完全沿用原 pickGuess（excluded 即原版传入的猜测排除集），保障「不影响非拟真模式」。
-  function decideMultiGuess(o) {
+  function decideRealisticGuess(o) {
     const cands = o.candidates;
     const excluded = o.excluded;
     const turn = o.turn;
@@ -645,6 +676,7 @@
     }
 
     const p = loadPersona();
+    const runtime = o.runtime || multi;
     let minG = o.roundMinGuesses;
     const confirmed = cands.length === 1;
     const twinLocked = isTwinCluster(cands); // 属性全同簇：反馈无法进一步区分
@@ -661,19 +693,19 @@
 
     // 困惑状态（成簇错误）：连续数手凭直觉乱猜，容忍绿格回退。
     // 人类失误是相关的，独立均匀撒错恰是非人类特征；困惑中偶尔直接命中答案也符合真人。
-    if (multi.confusedLeft > 0 && !confirmed && turn < minG) {
-      multi.confusedLeft--;
-      return pickIntuitionGuess(cands, excluded);
+    if (runtime.confusedLeft > 0 && !confirmed && turn < minG) {
+      runtime.confusedLeft--;
+      return pickIntuitionGuess(cands, excluded, runtime);
     }
     // 偶发直觉手：非困惑期小概率冲动猜测，打破「每手信息增益都在目标带内」的机器不变量；
     // 上头局频率提升——真人在不顺的局里更依赖直觉而非理性分析
-    if (!confirmed && turn > 0 && turn < minG && Math.random() < p.regressRate * (multi.choked ? 3 : 1)) {
-      return pickIntuitionGuess(cands, excluded);
+    if (!confirmed && turn > 0 && turn < minG && Math.random() < p.regressRate * (runtime.choked ? 2.2 : 1)) {
+      return pickIntuitionGuess(cands, excluded, runtime);
     }
 
     // 收敛速度自适应：到达目标回合但候选仍多 ⇒ 延长目标继续探路（真人此时不会硬求解）
     if (!confirmed && turn === minG - 1 && cands.length > 5 && remaining >= 3 && minG < 6) {
-      multi.roundMinGuesses = minG + 1;
+      runtime.roundMinGuesses = minG + 1;
       minG += 1;
     }
     const lastSolveTurn = Math.max(0, minG - 1); // 允许获胜的最后探路回合（0 基）
@@ -684,21 +716,24 @@
       return pickNearMiss(cands[0], excluded, bestGreens, minG - turn);
     }
     // 已过目标窗口：正常求解（允许获胜）；确认则提交。
-    // 上头局：候选压到 ≤2 后不枚举收尾，改猜候选集外的偏见选手（真人死钻牛角尖就是不猜那两个），
-    // 剩余回合自然耗尽成真实败局；候选仍多时候选内低效求解，不借全局池极限翻盘。
+    // 上头局按本回合强度在“继续偏见”与“回到候选收尾”之间切换，保留可逆性。
     if (turn >= minG) {
       if (confirmed) return cands[0];
-      if (multi.choked && cands.length <= 2) return pickIntuitionGuess(cands, excluded);
-      // 候选数 > 剩余步数时无法逐一枚举，用全局池求解以最大化信息增益（仅拟真模式且非上头）
-      const solvePool = (!multi.choked && cands.length > remaining) ? all : cands;
+      if (runtime.choked && cands.length <= 2 && Math.random() < (runtime.chokeStrength || 0.65)) {
+        return pickIntuitionGuess(cands, excluded, runtime);
+      }
+      // 上头局仍保留少量收尾能力，不制造绝对不可逆的败局通道。
+      const rescue = !runtime.choked || Math.random() > (runtime.chokeStrength || 0.65);
+      const solvePool = (rescue && cands.length > remaining) ? all : cands;
       return pickGuess(enc, cands, solvePool, excluded, remaining);
     }
     // 探路/逼近阶段（turn < minG, candidates>1）
     const blockWin = turn < lastSolveTurn;
     if (blockWin) {
-      // 上头局：探路期完全凭直觉（真人上头时头铁追猜想，不理性拆分候选集），
-      // 浪费的分裂机会使后期候选数压不下来，自然滑向手数耗尽
-      if (multi.choked) return pickIntuitionGuess(cands, excluded);
+      // 上头时提高直觉猜概率，但不完全关闭反馈驱动的探路。
+      if (runtime.choked && Math.random() < (runtime.chokeStrength || 0.65)) {
+        return pickIntuitionGuess(cands, excluded, runtime);
+      }
       // 禁胜窗口：只从候选集外选，保证绝不提前命中答案（winTurn 必 ≥ minG）。
       // 候选集外的猜测仍能按属性匹配给答案上色（绿/黄），面板自然变绿，且对候选集有信息增益。
       return pickNaturalGuess({ cands, excluded, turn, outsideOnly: true, modalAns: -1, bestGreens, remaining });
@@ -711,7 +746,7 @@
     }
     // 败局警戒：候选数 > 剩余步数时，自然猜测的信息增益不足以保证获胜，
     // 切换到 minimax 全局池求解（仅拟真模式且非上头；上头局继续自然逼近，允许真实败局）
-    if (!multi.choked && cands.length > remaining) {
+    if (cands.length > remaining && (!runtime.choked || Math.random() > (runtime.chokeStrength || 0.65))) {
       return pickGuess(enc, cands, all, excluded, remaining);
     }
     return pickNaturalGuess({ cands, excluded, turn, outsideOnly: false, modalAns: -1, bestGreens, remaining });
@@ -745,12 +780,33 @@
         confusionRate: 0.08 + Math.random() * 0.08,  // 本回合进入困惑（成簇错误）概率
         chokeRate: 0.05 + Math.random() * 0.06,      // 本回合上头（自然败局）概率
         afkRate: 0.05 + Math.random() * 0.06,        // 本回合出现 AFK 级停顿概率
+        delaySigma: 0.38 + Math.random() * 0.2,      // 思考时间离散度，安装级稳定
+        recoveryRate: 0.18 + Math.random() * 0.16,   // 上头后重新读面板/回到候选的概率
+        entropyTarget: 0.58 + Math.random() * 0.12,  // 信息增益偏好中心，不同安装不共用同一阈值
+        entropySpread: 0.16 + Math.random() * 0.08,  // 偏好带宽度
         openers: [],                                  // 惯用开局昵称（选手库就绪后惰性生成）
         favReg: -1,                                   // 偏好地区编码
         openersReady: false,
       };
-      try { GM_setValue(KEY_PERSONA, p); } catch (e) { /* quota */ }
     }
+    // 向前兼容 v0.11 人格：不重掷已有特质，只补齐新维度和合法边界。
+    const finiteOr = (value, fallback, lo, hi) => {
+      const n = Number(value);
+      return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fallback;
+    };
+    p.pace = finiteOr(p.pace, 0.85 + Math.random() * 0.4, 0.65, 1.45);
+    p.regressRate = finiteOr(p.regressRate, 0.05 + Math.random() * 0.07, 0.02, 0.2);
+    p.confusionRate = finiteOr(p.confusionRate, 0.08 + Math.random() * 0.08, 0.03, 0.25);
+    p.chokeRate = finiteOr(p.chokeRate, 0.05 + Math.random() * 0.06, 0.02, 0.18);
+    p.afkRate = finiteOr(p.afkRate, 0.05 + Math.random() * 0.06, 0.01, 0.2);
+    p.delaySigma = finiteOr(p.delaySigma, 0.38 + Math.random() * 0.2, 0.25, 0.75);
+    p.recoveryRate = finiteOr(p.recoveryRate, 0.18 + Math.random() * 0.16, 0.08, 0.5);
+    p.entropyTarget = finiteOr(p.entropyTarget, 0.58 + Math.random() * 0.12, 0.45, 0.78);
+    p.entropySpread = finiteOr(p.entropySpread, 0.16 + Math.random() * 0.08, 0.1, 0.3);
+    if (!Array.isArray(p.openers)) p.openers = [];
+    if (!Number.isInteger(p.favReg)) p.favReg = -1;
+    if (typeof p.openersReady !== 'boolean') p.openersReady = false;
+    try { GM_setValue(KEY_PERSONA, p); } catch (e) { /* quota */ }
     _personaCache = p;
     return p;
   }
@@ -778,13 +834,19 @@
   // 自动推算本局最少猜测目标（v0.11.0 起不再手配）：
   // 候选池规模（log2 缩放）与历史均步（足够样本时）各半混合，
   // 策略预设平移，再掷随机扰动——避免固定目标值成为跨局可估计的参数指纹。
-  function computeRoundTarget(h) {
+  function computeRoundTarget(h, mode) {
     const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-    const pool = enc ? enc.n : 0;
+    const activeMode = mode || multi.mode || state.mode;
+    const pool = enc ? modePool(activeMode).length : 0;
     const poolBase = pool > 1 ? clamp(Math.round(Math.log2(pool) / 2), 2, 5) : 3;
-    const m = (loadStats().modes || {})[multi.mode];
-    const histBase = (m && m.games >= 8 && m.games > 0)
-      ? clamp(Math.round(m.guesses / m.games), 2, 6) : poolBase;
+    const m = (loadStats().modes || {})[activeMode];
+    const attemptedGames = m ? Number(m.attemptedGames || 0) : 0;
+    const attemptedGuesses = m ? Number(m.attemptedGuesses || 0) : 0;
+    const legacyGames = m ? Number(m.games || 0) : 0;
+    const histAverage = attemptedGames >= 8
+      ? attemptedGuesses / attemptedGames
+      : legacyGames >= 8 ? Number(m.guesses || 0) / legacyGames : 0;
+    const histBase = histAverage > 0 ? clamp(Math.round(histAverage), 2, 6) : poolBase;
     let base = Math.round((poolBase + histBase) / 2);
     if (h.strategy === 'conservative') base += 1;
     else if (h.strategy === 'aggressive') base -= 1;
@@ -792,8 +854,12 @@
     return clamp(base, 2, 6);
   }
 
-  // 每回合开始时掷骰：放水（聚簇分布）、困惑状态、AFK 配额、本回合最少猜测目标。
-  function rollRoundProfile() {
+  // 每回合开始时掷骰：放弃计划、困惑/上头状态、AFK 配额与本回合目标。
+  // runtime 可为 state 或 multi；单人只复用认知拟真，不自动触发跳过。
+  function rollRoundProfile(runtime, options) {
+    const active = runtime || multi;
+    const opts = options || {};
+    const allowSkip = opts.allowSkip !== false;
     const h = handicapConfig();
     const p = loadPersona();
     ensurePersonaTraits();
@@ -801,27 +867,31 @@
     // 放水聚簇：人类状态有惯性（连败/手感热），均匀伯努利放水是采样器指纹。
     // 动量只小幅放大且封顶：制造 2~3 连败的短串而非失控长连败，避免整体胜率偏离合理区间。
     let lose = false;
-    if (h.enabled && h.loseRate > 0) {
+    if (allowSkip && h.enabled && h.loseRate > 0) {
       const rate = _sess.loseMomentum > 0
         ? Math.min(0.3, h.loseRate * (1 + 0.25 * Math.min(2, _sess.loseMomentum)))
         : h.loseRate * 0.75;
       lose = Math.random() < rate;
     }
-    _sess.loseMomentum = lose ? _sess.loseMomentum + 1 : Math.max(0, _sess.loseMomentum - 1);
-    multi.handicapLose = lose;
-    multi.handicapSkipDone = false;
-    multi.roundMinGuesses = h.enabled ? computeRoundTarget(h) : 0;
-    // 困惑状态：触发后连续 2~3 手成簇变差；放水局不困惑（直接跳过）
-    multi.confusedLeft = (h.enabled && !lose && Math.random() < p.confusionRate)
+    if (allowSkip) _sess.loseMomentum = lose ? _sess.loseMomentum + 1 : Math.max(0, _sess.loseMomentum - 1);
+    active.handicapLose = lose;
+    active.handicapSkipDone = false;
+    active.roundMinGuesses = h.enabled ? computeRoundTarget(h, active.mode) : 0;
+    active.giveUpAfter = lose ? 1 + Math.floor(Math.random() * Math.max(1, Math.min(3, active.roundMinGuesses || 3))) : 0;
+    // 困惑状态：触发后连续 2~3 手成簇变差；已有放弃计划时不再叠加困惑。
+    active.confusedLeft = (h.enabled && !lose && Math.random() < p.confusionRate)
       ? 2 + Math.floor(Math.random() * 2) : 0;
-    // 上头局：禁用败局救援 + 直觉手频率提升，产生真实的 8 手耗尽败局。
-    // 「不弃局则必胜」的条件分布是强机器指纹，败局必须来自真实猜不出而非只靠跳过。
-    multi.choked = h.enabled && !lose && Math.random() < p.chokeRate;
+    // 上头是可恢复的渐变状态，而非“禁猜候选”开关。
+    active.choked = h.enabled && !lose && Math.random() < p.chokeRate;
+    active.chokeStrength = active.choked
+      ? Math.min(0.82, Math.max(0.42, 0.76 - p.recoveryRate * 0.55 + Math.random() * 0.16))
+      : 0;
     // AFK 配额：整回合至多一次长停顿，触发时机在延迟模型里掷
-    multi.afkPending = h.enabled && !lose && Math.random() < p.afkRate;
-    multi.afkDone = false;
-    multi.lastGreens = 0;
-    multi.rhythm = [];
+    active.afkPending = h.enabled && !lose && Math.random() < p.afkRate;
+    active.afkDone = false;
+    active.lastGreens = 0;
+    active.rhythm = [];
+    active.roundStartedAt = Date.now();
     return lose;
   }
 
@@ -833,29 +903,34 @@
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
   }
 
-  // 提交前延迟（毫秒）—— v0.11.0 思考时间模型（对抗 guessTimesMs 序列分析）：
-  // 1) log-normal 基础分布（右偏长尾），中位由延迟区间与人格节奏决定；
+  // 提交前延迟（毫秒）——服务器保存的是回合起点后累计时间，外部分析可差分出单手间隔。
+  // 1) UI 区间表示“典型范围”而非硬上下界，log-normal 软尾部可自然穿越范围；
   // 2) 反馈耦合：上一手绿格多 ⇒ 停下来读面板；全红 ⇒ 快换思路或长考（真人阅读反馈的节奏）；
   // 3) 选手耦合：所选猜测越冷门，「回忆」越久；
-  // 4) 连击后犹豫：连续两手偏快 ⇒ 本手大幅变慢（真人节奏不均匀，快慢成对出现）；
-  // 5) 偶发 AFK 级停顿（可突破区间上限）；6) 会话热身/疲劳漂移。
+  // 4) 连击后犹豫：连续两手偏快后概率性变慢；5) 长停顿受回合剩余预算限制；6) 热身/疲劳漂移。
   // 0~0 区间 = 不额外延迟（提交速度等同关闭拟真，仅受冷却约束）。
   function handicapDelayMs(gIdx) {
     const h = handicapConfig();
     if (!h.enabled) return 0;
-    const lo = Math.max(0, h.delaySecMin || 0);
-    const hiCap = Math.max(0, h.delaySecMax || 0);
-    if (lo === 0 && hiCap === 0) return 0;
-    const hi = Math.max(lo + 1, hiCap);
+    const lo = Math.max(0, Number(h.delaySecMin || 0));
+    const hiValue = Math.max(0, Number(h.delaySecMax || 0));
+    if (lo === 0 && hiValue === 0) return 0;
+    const typicalLo = Math.max(0.8, lo || hiValue * 0.35 || 1);
+    const typicalHi = Math.max(typicalLo + 0.8, hiValue || typicalLo * 2.5);
     const p = loadPersona();
-    // AFK：长停顿必须混入时间序列才有意义，一旦触发必突破常规区间
-    if (multi.afkPending && !multi.afkDone && Math.random() < 0.16) {
+    const elapsed = Math.max(0, (Date.now() - (multi.roundStartedAt || Date.now())) / 1000);
+    const remainingBudget = Math.max(0.8, 112 - elapsed);
+    // 长停顿使用指数软尾，且只在回合还有足够时间时触发。
+    if (multi.afkPending && !multi.afkDone && remainingBudget > 28 && Math.random() < 0.14) {
       multi.afkDone = true;
-      return (30 + Math.random() * 60) * 1000;
+      const pause = 18 + Math.min(52, -Math.log(1 - Math.random()) * 16);
+      const budgeted = Math.min(pause, remainingBudget * (0.72 + Math.random() * 0.16));
+      multi.rhythm.push(budgeted);
+      return Math.round(budgeted * 1000);
     }
     const turn = multi.turn;
     const cands = multi.candidates.length;
-    let mu = Math.log(Math.max(2, (lo + hi) / 2));
+    let mu = Math.log(Math.sqrt(typicalLo * typicalHi));
     mu += Math.log(p.pace);
     mu += cands > 1 ? Math.min(0.35, Math.log2(cands) / 25) : -0.12;
     mu += turn === 0 ? -0.3 : Math.min(0.2, turn * 0.04);
@@ -871,14 +946,21 @@
     // 连击后犹豫：最近两手都明显偏快 ⇒ 真人必然慢下来权衡
     const rh = multi.rhythm;
     if (rh.length >= 2) {
-      const mid = (lo + hi) / 2;
-      if (rh[rh.length - 1] < mid * 0.55 && rh[rh.length - 2] < mid * 0.55) mu += 0.55 + Math.random() * 0.35;
+      const mid = Math.sqrt(typicalLo * typicalHi);
+      if (rh[rh.length - 1] < mid * 0.55 && rh[rh.length - 2] < mid * 0.55 && Math.random() < 0.68) {
+        mu += 0.42 + Math.random() * 0.32;
+      }
     }
     // 会话漂移：开局热身偏慢，长会话疲劳后略快且随意
     if (_sess.rounds <= 2) mu += 0.15;
     else if (_sess.rounds > 14) mu -= 0.08;
-    const sec = Math.exp(mu + 0.45 * randNorm());
-    const out = Math.max(lo, Math.min(hi, sec)) * 1000;
+    const derivedSigma = Math.min(0.72, Math.max(0.28, Math.log(typicalHi / typicalLo) / 2.56));
+    const sigma = (derivedSigma + p.delaySigma) / 2;
+    let sec = Math.exp(mu + sigma * randNorm());
+    // 仅保留物理边界，不把样本压在 UI 的 lo/hi 上形成边界堆积。
+    if (sec < 0.7) sec = 0.7 + Math.random() * 0.55;
+    if (sec > remainingBudget) sec = remainingBudget * (0.72 + Math.random() * 0.2);
+    const out = Math.round(sec * 1000);
     rh.push(out / 1000);
     if (rh.length > 4) rh.shift();
     return Math.round(out);
@@ -929,7 +1011,7 @@
     multi.turn = 0;
     multi.guessed = new Set();
     multi.submitted = new Set();
-    multi.candidates = all.slice();
+    multi.candidates = modePool(multi.mode);
     multi.lastRowCount = 0;
     multi.lastIdx = -1;
     multi.fillPending = null;
@@ -942,6 +1024,7 @@
     multi.handicapPlan = newHandicapPlan();
     multi.bestGreens = 0;
     multi.roundCloseTeams = [];
+    multi.roundStartedAt = Date.now();
     rollRoundProfile();
   }
 
@@ -951,7 +1034,6 @@
   function resetMultiAfterDataSync() {
     if (!multi.active || !enc) return;
     resetMultiRound();
-    if (multi.handicapLose) return;
     const selfBoard = document.querySelector('.player-board-self');
     const table = selfBoard ? selfBoard.querySelector('.game-table') : null;
     const rows = table ? table.querySelectorAll('tbody tr') : [];
@@ -1014,7 +1096,13 @@
   function applyMergedPlayers() {
     savePlayersCache(cache);
     ensureEncoded();
-    if (state.inGame) { state.candidates = all.slice(); state.guessed = new Set(); state.turn = 0; state.lastIdx = -1; computeAndFill(); }
+    if (state.inGame) {
+      state.candidates = modePool(state.mode);
+      state.guessed = new Set(); state.turn = 0; state.lastIdx = -1;
+      state.bestGreens = 0; state.confusedLeft = 0; state.choked = false;
+      rollRoundProfile(state, { allowSkip: false });
+      computeAndFill();
+    }
     resetMultiAfterDataSync();
     updateDataSourceBadge();
     updateLibSummary();
@@ -1027,6 +1115,34 @@
       return true;
     }
     return false;
+  }
+
+  // 与服务器的 player_difficulties 保持同一候选池。旧格式缓存没有 difficulties 时保留全量回退，
+  // 但只要数据覆盖足够，就不再把不属于当前难度的选手放进局内候选集。
+  function modePoolInfo(mode) {
+    const players = cache && Array.isArray(cache.players) ? cache.players : [];
+    if (!players.length || !MODE_KEYS.has(mode)) return { indices: all.slice(), exact: false, known: 0, total: players.length };
+    const known = players.filter(p => Array.isArray(p.difficulties) && p.difficulties.length).length;
+    if (known < Math.ceil(players.length * MODE_POOL_MIN_COVERAGE)) {
+      return { indices: all.slice(), exact: false, known, total: players.length };
+    }
+    const indices = players
+      .map((p, i) => {
+        const difficulties = Array.isArray(p.difficulties) ? p.difficulties : [];
+        // 服务器种子数据对缺失 difficulties 的默认是 normal。
+        return (difficulties.includes(mode) || (mode === 'normal' && !difficulties.length)) ? i : -1;
+      })
+      .filter(i => i >= 0);
+    return {
+      indices: indices.length ? indices : all.slice(),
+      exact: indices.length > 0,
+      known,
+      total: players.length,
+    };
+  }
+
+  function modePool(mode) {
+    return modePoolInfo(mode).indices;
   }
 
   // 首次使用无本地选手库：自动从仓库拉取 players_full.json 作为初始数据（大多数用户的零操作路径）。
@@ -1209,7 +1325,13 @@
   // 同步完成/取消后重建编码与对局状态（一次性，避免逐条同步反复打断进行中的对局）
   function applyMergedData() {
     ensureEncoded();
-    if (state.inGame) { state.candidates = all.slice(); state.guessed = new Set(); state.turn = 0; state.lastIdx = -1; computeAndFill(); }
+    if (state.inGame) {
+      state.candidates = modePool(state.mode);
+      state.guessed = new Set(); state.turn = 0; state.lastIdx = -1;
+      state.bestGreens = 0; state.confusedLeft = 0; state.choked = false;
+      rollRoundProfile(state, { allowSkip: false });
+      computeAndFill();
+    }
     resetMultiAfterDataSync();
     updateDataSourceBadge();
     updateLibSummary();
@@ -1509,11 +1631,28 @@
     m.games++;
     if (won) m.wins++;
     m.guesses += guesses;
+    // 目标推算只使用真正发生过猜测的对局；0 手跳过不再人为拉低历史均步。
+    if (guesses > 0) {
+      m.attemptedGames = Number(m.attemptedGames || 0) + 1;
+      m.attemptedGuesses = Number(m.attemptedGuesses || 0) + guesses;
+    }
     if (answerNick) m.answers[answerNick] = (m.answers[answerNick] || 0) + 1;
     stats.games.push({ mode, won, guesses, answer: answerNick, at: Date.now() });
     if (stats.games.length > 200) stats.games.splice(0, stats.games.length - 200);
     saveStats(stats);
     return m;
+  }
+
+  // 统一统计口径：跳过/止损回合保留在总局数与胜率中，但不参与“有效均步”。
+  // 旧版统计没有 attempted 字段时，退回旧口径，保证迁移期间显示不突变。
+  function attemptedSummary(m) {
+    const hasAttempted = m && Object.prototype.hasOwnProperty.call(m, 'attemptedGames')
+      && Object.prototype.hasOwnProperty.call(m, 'attemptedGuesses');
+    const games = Number(m && m.games) || 0;
+    const guesses = Number(m && m.guesses) || 0;
+    const attemptedGames = hasAttempted ? Math.max(0, Number(m.attemptedGames) || 0) : games;
+    const attemptedGuesses = hasAttempted ? Math.max(0, Number(m.attemptedGuesses) || 0) : guesses;
+    return { attemptedGames, attemptedGuesses, skipped: Math.max(0, games - attemptedGames) };
   }
 
   // 历史队伍对局积累：服务端 close 反馈 ⇒ 猜测队伍 ∈ 答案选手历史队伍。
@@ -1548,7 +1687,11 @@
     state.guessed = new Set();
     state.lastIdx = -1;
     state.pendingHistory = [];
-    state.candidates = all.slice();
+    state.candidates = modePool(state.mode);
+    state.bestGreens = 0;
+    state.confusedLeft = 0;
+    state.choked = false;
+    rollRoundProfile(state, { allowSkip: false });
     if (enc) computeAndFill();
   }
 
@@ -1610,6 +1753,11 @@
     if (gIdx >= 0) {
       state.candidates = filterCandidates(enc, state.candidates, gIdx, keys);
       state.guessed.add(gIdx);
+      if (fb.attributes) {
+        const greens = Object.values(fb.attributes).filter(attr => attr && attr.level === 'correct').length;
+        if (greens > state.bestGreens) state.bestGreens = greens;
+        state.lastGreens = greens;
+      }
     } else {
       setStatus('警告：服务器选手与本地库不一致，请同步数据');
     }
@@ -1630,10 +1778,11 @@
 
   function endGame(won, guesses, answerNick) {
     const m = recordGame(state.mode, won, guesses, answerNick);
+    const attempted = attemptedSummary(m);
     learnTeamHistory(answerNick, state.pendingHistory);
     state.pendingHistory = [];
     setStatus(
-      `本局${won ? '获胜' : '结束'}（${guesses} 步）· 该难度战绩 ${m.wins}/${m.games} 胜率 ${m.games ? Math.round(100 * m.wins / m.games) : 0}% 平均 ${m.games ? (m.guesses / m.games).toFixed(1) : '-'} 步`
+      `本局${won ? '获胜' : '结束'}（${guesses} 步）· 该难度战绩 ${m.wins}/${m.games} 胜率 ${m.games ? Math.round(100 * m.wins / m.games) : 0}% 有效均步 ${attempted.attemptedGames ? (attempted.attemptedGuesses / attempted.attemptedGames).toFixed(1) : '-'}${attempted.skipped ? ` · 跳过 ${attempted.skipped}` : ''}`
     );
     state.inGame = false;
   }
@@ -1646,20 +1795,46 @@
       return;
     }
     const remaining = state.maxGuesses - state.turn;
-    const g = pickGuess(enc, cands, all, state.guessed, remaining);
+    const h = handicapConfig();
+    let g = h.enabled
+      ? decideRealisticGuess({
+          enc, all,
+          candidates: cands,
+          excluded: state.guessed,
+          turn: state.turn,
+          maxGuesses: state.maxGuesses,
+          handicapEnabled: true,
+          roundMinGuesses: state.roundMinGuesses,
+          plan: null,
+          bestGreens: state.bestGreens,
+          runtime: state,
+        })
+      : pickGuess(enc, cands, all, state.guessed, remaining);
+    if (g === undefined || g < 0) {
+      const available = cands.filter(c => !state.guessed.has(c));
+      g = available.length ? pickGuess(enc, cands, all, state.guessed, remaining)
+        : all.find(c => !state.guessed.has(c));
+    }
+    if (g === undefined || g < 0) {
+      setStatus('本局已无可用猜测');
+      return;
+    }
     state.lastIdx = g;
     const stats = loadStats();
     const modeStats = stats.modes[state.mode];
     const expCount = modeStats ? (modeStats.answers[enc.nicks[g]] || 0) : 0;
+    const pool = modePoolInfo(state.mode);
     renderPanel({
       mode: state.mode,
       cands: cands.length,
-      total: enc.n,
+      total: pool.indices.length,
       turn: state.turn,
       max: state.maxGuesses,
       nick: enc.nicks[g],
       exp: expCount,
       statusLine: state.statusLine || '',
+      poolExact: pool.exact,
+      handicap: h.enabled ? { turn: state.turn, minG: state.roundMinGuesses, cands: cands.length, runtime: state } : null,
       twinLocked: cands.length > 1 && isTwinCluster(cands)
     });
     if (loadSettings().autoFill) fillInput(enc.nicks[g]);
@@ -1765,8 +1940,6 @@
       setStatus('多人：候选集已空（数据异常）');
       return;
     }
-    // 放水局：不填不猜，等 pollMulti 点「跳过本局」
-    if (multi.handicapLose) return;
     const h = handicapConfig();
     // 非拟真排除集与原版逐字一致（guessed∪submitted，不含 pending），
     // 拟真排除集额外含 pendingIdx，避免重提未确认的猜测
@@ -1774,7 +1947,7 @@
     const excluded = h.enabled
       ? new Set([...multi.guessed, ...multi.submitted, ...pendingSet])
       : new Set([...multi.guessed, ...multi.submitted]);
-    let g = decideMultiGuess({
+    let g = decideRealisticGuess({
       enc, all,
       candidates: cands,
       excluded,
@@ -1784,6 +1957,7 @@
       roundMinGuesses: multi.roundMinGuesses,
       plan: multi.handicapPlan,
       bestGreens: multi.bestGreens,
+      runtime: multi,
     });
     if (g === undefined || g < 0) {
       // 兜底：决策返回无效时退回 solver
@@ -1796,8 +1970,9 @@
       return;
     }
     multi.lastIdx = g;
-    const hcInfo = h.enabled ? { turn: multi.turn, minG: multi.roundMinGuesses, cands: cands.length } : null;
-    renderPanel({ mode: multi.mode, cands: cands.length, total: enc.n, turn: multi.turn, max: 8, nick: enc.nicks[g], exp: 0, statusLine, handicap: hcInfo, twinLocked: cands.length > 1 && isTwinCluster(cands) });
+    const pool = modePoolInfo(multi.mode);
+    const hcInfo = h.enabled ? { turn: multi.turn, minG: multi.roundMinGuesses, cands: cands.length, runtime: multi } : null;
+    renderPanel({ mode: multi.mode, cands: cands.length, total: pool.indices.length, turn: multi.turn, max: 8, nick: enc.nicks[g], exp: 0, statusLine, handicap: hcInfo, poolExact: pool.exact, twinLocked: cands.length > 1 && isTwinCluster(cands) });
     if (loadSettings().autoFill) {
       if (!fillMulti(enc.nicks[g])) multi.fillPending = enc.nicks[g];
     }
@@ -2063,9 +2238,12 @@
       }
       return;
     }
-    // 放水局：不填不猜，点「跳过本局」并确认对话框判负。
-    // 无确认框时点跳过按钮；出现跳过确认框后点确认才算完成，避免对局卡在确认框。
-    if (multi.handicapLose && !multi.handicapSkipDone) {
+    // 计划放弃也先完成 1~3 手真实尝试：消除固定零猜测跳过指纹，同时给用户反悔/意外命中的窗口。
+    if (multi.handicapLose && multi.turn >= multi.giveUpAfter && !multi.handicapSkipDone) {
+      multi.fillPending = null;
+      multi.lastIdx = -1;
+      multi.autoSubmit = { pending: false, attempted: false, expected: '', lastClick: 0, nextAttemptAt: 0, delayUntil: 0 };
+      setStatus(`拟真：本轮在 ${multi.turn} 次尝试后选择止损`);
       if (!document.querySelector('.confirm-dialog[role="alertdialog"]')) {
         clickSkipButton();
       } else if (clickSkipConfirm()) {
@@ -2247,19 +2425,40 @@
     if (!panelRoot) return;
     const el = panelRoot.getElementById('hc-live');
     if (!el) return;
+    const main = panelRoot.getElementById('hc-live-main');
+    const phaseEl = panelRoot.getElementById('hc-live-phase');
+    const sub = panelRoot.getElementById('hc-live-sub');
     const h = loadSettings().handicap;
     if (!h.enabled) {
-      el.textContent = '拟真模式未启用：猜测目标、失误与停顿均不介入';
+      if (main) main.textContent = '拟真模式未启用';
+      if (phaseEl) phaseEl.textContent = '待机';
+      if (sub) sub.textContent = '猜测目标、失误与停顿均不介入';
       el.classList.add('idle');
       return;
     }
     el.classList.remove('idle');
     const stratName = { conservative: '保守', balanced: '均衡', aggressive: '激进' }[h.strategy] || '均衡';
-    if (multi.active && !multi.ended && multi.roundMinGuesses > 0) {
-      el.textContent = `拟真运行中 · 本回合目标 ${multi.roundMinGuesses} 猜 · ${stratName}策略自动计算`;
-    } else {
-      el.textContent = `拟真已启用 · ${stratName}策略 · 目标按池规模/历史均步自动计算`;
+    const active = multi.active && !multi.ended ? multi : state.inGame ? state : null;
+    const mode = active && active.mode ? active.mode : (multi.mode || state.mode || 'normal');
+    const pool = modePoolInfo(mode);
+    const poolLabel = `${MODE_NAMES[mode] || mode} · 池 ${pool.indices.length}${pool.exact ? '（精确）' : '（数据覆盖不足，暂用全量）'}`;
+    const delayLabel = (h.delaySecMin === 0 && h.delaySecMax === 0) ? '无额外延迟' : `${h.delaySecMin}~${h.delaySecMax}s 典型延迟`;
+    let phase = '待机';
+    let targetLabel = '目标自动计算';
+    let planLabel = '本回合不止损';
+    if (active && active.roundMinGuesses > 0) {
+      const turn = Number(active.turn || 0);
+      const minG = Number(active.roundMinGuesses || 0);
+      const cands = Array.isArray(active.candidates) ? active.candidates.length : 0;
+      phase = cands <= 1 ? '锁定' : turn < minG - 1 ? '探路' : turn < minG ? '逼近' : '收尾';
+      targetLabel = `本回合目标 ${minG} 猜`;
+      if (active.handicapLose) planLabel = active.giveUpAfter > 0 ? `止损计划：第 ${active.giveUpAfter} 手后` : '止损计划已排队';
     }
+    if (main) main.textContent = active
+      ? `拟真运行中 · ${targetLabel} · ${stratName}策略`
+      : `拟真已启用 · ${stratName}策略`;
+    if (phaseEl) phaseEl.textContent = phase;
+    if (sub) sub.textContent = `${poolLabel} · ${delayLabel} · ${planLabel}`;
   }
 
   function createPanel() {
@@ -2270,7 +2469,7 @@
     shadow.innerHTML = `
       <style>
         *{box-sizing:border-box;margin:0;padding:0}
-        .fb-panel{width:248px;background:rgba(15,17,23,.92);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);color:#e4e7ec;border:1px solid rgba(255,255,255,.06);border-radius:14px;padding:0;box-shadow:0 8px 32px rgba(0,0,0,.55),0 0 0 1px rgba(255,255,255,.03) inset;font-size:13px;line-height:1.5;overflow:hidden;transition:opacity .25s,transform .25s}
+        .fb-panel{width:286px;max-width:calc(100vw - 24px);background:rgba(15,17,23,.94);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);color:#e4e7ec;border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:0;box-shadow:0 8px 32px rgba(0,0,0,.55),0 0 0 1px rgba(255,255,255,.03) inset;font-size:13px;line-height:1.5;overflow:hidden;transition:opacity .25s,transform .25s}
         .fb-panel.collapsed{opacity:0;transform:scale(.9) translateY(8px);pointer-events:none;height:0;padding:0;border:0}
         /* 标题栏（可拖拽） */
         .fb-header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px 8px;cursor:move;user-select:none;border-bottom:1px solid rgba(255,255,255,.05)}
@@ -2279,7 +2478,7 @@
         .fb-mode{font-size:10px;color:#8b95a5;background:rgba(255,255,255,.05);padding:2px 7px;border-radius:20px}
         .fb-src{font-size:10px;padding:2px 7px;border-radius:20px;background:rgba(127,180,255,.12);color:#7fb4ff}
         .fb-src.merged{background:rgba(110,231,160,.12);color:#6ee7a0}
-        .fb-collapse{width:20px;height:20px;border:0;background:rgba(255,255,255,.06);color:#8b95a5;border-radius:6px;cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center;transition:background .15s}
+        .fb-collapse{width:24px;height:24px;border:0;background:rgba(255,255,255,.06);color:#8b95a5;border-radius:6px;cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center;transition:background .15s}
         .fb-collapse:hover{background:rgba(255,255,255,.12);color:#fff}
         /* 主体 */
         .fb-body{padding:10px 14px 12px}
@@ -2297,7 +2496,7 @@
         .fb-toggle.on{background:rgba(110,231,160,.1);border-color:rgba(110,231,160,.25);color:#6ee7a0}
         /* 拟真配置抽屉 */
         .fb-hc{max-height:0;overflow:hidden;transition:max-height .3s ease,opacity .25s;opacity:0;margin-bottom:0}
-        .fb-hc.open{max-height:260px;opacity:1;margin-bottom:10px}
+        .fb-hc.open{max-height:320px;opacity:1;margin-bottom:10px}
         .fb-hc-inner{padding:10px;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);border-radius:10px}
         .fb-hc-inner label{display:flex;justify-content:space-between;align-items:center;margin:5px 0;font-size:11px;color:#9aa3b2}
         .fb-hc .range-row{display:flex;align-items:center;gap:3px}
@@ -2308,8 +2507,12 @@
         .fb-hc-btns{display:flex;gap:6px;margin-top:8px}
         .fb-hc-btns button{flex:1;padding:5px 0;border-radius:7px;border:0;cursor:pointer;font-size:11px;font-weight:500;color:#fff;transition:filter .15s}
         .fb-hc-btns button:hover{filter:brightness(1.15)}
-        .fb-hc-live{font-size:10px;color:#6ee7a0;background:rgba(110,231,160,.07);border:1px solid rgba(110,231,160,.15);padding:4px 8px;border-radius:8px;margin-bottom:5px;line-height:1.4;transition:all .2s}
+        .fb-hc-live{font-size:10px;color:#6ee7a0;background:rgba(110,231,160,.07);border:1px solid rgba(110,231,160,.15);padding:7px 8px;border-radius:8px;margin:7px 0 6px;line-height:1.4;transition:all .2s}
+        .fb-hc-live-main{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;font-weight:600}
+        .fb-hc-live-phase{flex:0 0 auto;padding:1px 6px;border-radius:999px;background:rgba(110,231,160,.12);font-size:10px;font-weight:500}
+        .fb-hc-live-sub{margin-top:3px;color:#9ba7b8;font-size:10px;line-height:1.45}
         .fb-hc-live.idle{color:#8b95a5;background:rgba(255,255,255,.02);border-color:rgba(255,255,255,.06)}
+        .fb-hc-live.idle .fb-hc-live-phase{background:rgba(255,255,255,.07);color:#aab2bf}
         /* 选手库数据卡片（导入/同步/仓库拉取 + 数据说明 合并） */
         .fb-libcard{background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:8px 9px;margin-bottom:10px}
         .fb-lib-head{display:flex;align-items:center;gap:7px;margin-bottom:7px}
@@ -2344,15 +2547,26 @@
         .fb-dot{width:36px;height:36px;border-radius:50%;background:rgba(15,17,23,.9);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.1);box-shadow:0 4px 16px rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;cursor:pointer;transition:transform .2s,box-shadow .2s;color:#6ee7a0;font-size:14px;font-weight:700}
         .fb-dot:hover{transform:scale(1.1);box-shadow:0 6px 20px rgba(0,0,0,.5)}
         .fb-dot.show{display:flex}
+        button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid rgba(127,180,255,.9);outline-offset:2px}
+        @media (max-width:420px){
+          .fb-panel{width:calc(100vw - 24px)}
+          .fb-header{padding-left:12px;padding-right:12px}
+          .fb-body{padding-left:12px;padding-right:12px}
+          .fb-hc-inner label{align-items:flex-start;gap:8px}
+          .fb-hc select{max-width:175px}
+        }
+        @media (prefers-reduced-motion:reduce){
+          *,*::before,*::after{scroll-behavior:auto!important;transition-duration:.01ms!important;animation-duration:.01ms!important;animation-iteration-count:1!important}
+        }
       </style>
-      <div class="fb-dot" id="fb-dot">弗</div>
+      <div class="fb-dot" id="fb-dot" role="button" tabindex="0" aria-label="展开助手面板">弗</div>
       <div class="fb-panel" id="fb-panel">
         <div class="fb-header" id="fb-drag">
           <h1>弗一把助手</h1>
           <div class="fb-header-right">
             <span class="fb-src" id="fb-src" title="数据来源">本地</span>
             <span class="fb-mode" id="fb-mode">-</span>
-            <button class="fb-collapse" id="fb-min" title="收起">─</button>
+            <button type="button" class="fb-collapse" id="fb-min" title="收起面板" aria-label="收起面板" aria-expanded="true">─</button>
           </div>
         </div>
         <div class="fb-body">
@@ -2362,22 +2576,25 @@
             <div class="fb-guess idle" id="fb-guess">─</div>
           </div>
           <div class="fb-toggles">
-            <button class="fb-toggle" id="fb-autosubmit">自动提交</button>
-            <button class="fb-toggle" id="fb-handicap">拟真</button>
+            <button type="button" class="fb-toggle" id="fb-autosubmit" aria-pressed="false">自动提交</button>
+            <button type="button" class="fb-toggle" id="fb-handicap" aria-pressed="false" aria-expanded="false" aria-controls="fb-hc">拟真</button>
           </div>
           <div class="fb-hc" id="fb-hc">
             <div class="fb-hc-inner">
-              <label><span>启用拟真模式</span><input type="checkbox" id="hc-enabled"></label>
-              <label title="猜测目标、失误节奏、停顿均由脚本自动推算"><span>策略</span>
+              <label for="hc-enabled"><span>启用拟真模式</span><input type="checkbox" id="hc-enabled"></label>
+              <label for="hc-strategy" title="猜测目标、失误节奏、停顿均由脚本自动推算"><span>策略</span>
                 <select id="hc-strategy">
                   <option value="conservative">保守 · 慢收敛更像新人</option>
                   <option value="balanced">均衡 · 自适应（推荐）</option>
                   <option value="aggressive">激进 · 快收敛胜率优先</option>
                 </select>
               </label>
-              <div class="fb-hc-live" id="hc-live">最少猜测自动适应池规模与历史均步</div>
-              <label title="0~0 秒 = 无额外延迟，提交速度等同关闭拟真"><span>提交延迟</span><span class="range-row"><input type="number" id="hc-delay-lo" min="0" max="60" step="1"><span>~</span><input type="number" id="hc-delay-hi" min="0" max="60" step="1"><span>秒</span></span></label>
-              <label><span>放水概率</span>
+              <div class="fb-hc-live" id="hc-live" aria-live="polite">
+                <div class="fb-hc-live-main"><span id="hc-live-main">拟真已启用</span><span class="fb-hc-live-phase" id="hc-live-phase">待机</span></div>
+                <div class="fb-hc-live-sub" id="hc-live-sub">目标按难度池和历史尝试自动计算</div>
+              </div>
+              <label for="hc-delay-lo" title="典型思考范围；log-normal 软尾部可能略超出区间"><span>典型延迟</span><span class="range-row"><input type="number" id="hc-delay-lo" min="0" max="60" step="1" aria-label="典型延迟下限"><span>~</span><input type="number" id="hc-delay-hi" min="0" max="60" step="1" aria-label="典型延迟上限"><span>秒</span></span></label>
+              <label for="hc-lose"><span>止损概率</span>
                 <select id="hc-lose">
                   <option value="0">0%</option>
                   <option value="0.1">10%</option>
@@ -2388,8 +2605,8 @@
                 </select>
               </label>
               <div class="fb-hc-btns">
-                <button id="hc-save" style="background:#2d8a56">保存</button>
-                <button id="hc-close" style="background:rgba(255,255,255,.08)">关闭</button>
+                <button type="button" id="hc-save" style="background:#2d8a56">保存</button>
+                <button type="button" id="hc-close" style="background:rgba(255,255,255,.08)">关闭</button>
               </div>
             </div>
           </div>
@@ -2397,12 +2614,12 @@
             <div class="fb-lib-head">
               <span class="fb-lib-title">选手库</span>
               <span class="fb-lib-sum" id="fb-lib-sum">无数据</span>
-              <button class="fb-lib-toggle" id="fb-lib-toggle" title="展开/收起数据说明">▾</button>
+              <button type="button" class="fb-lib-toggle" id="fb-lib-toggle" title="展开/收起数据说明" aria-expanded="false" aria-controls="fb-lib-detail">▾</button>
             </div>
             <div class="fb-lib-actions">
-              <button id="fb-import" title="从本地 JSON 文件导入选手">导入 JSON</button>
-              <button id="fb-sync" title="从游戏服务器增量同步选手属性">同步服务器</button>
-              <button id="fb-repo" title="从仓库重新拉取 players_full.json">重试拉取</button>
+              <button type="button" id="fb-import" title="从本地 JSON 文件导入选手">导入 JSON</button>
+              <button type="button" id="fb-sync" title="从游戏服务器增量同步选手属性">同步服务器</button>
+              <button type="button" id="fb-repo" title="从仓库重新拉取 players_full.json">重试拉取</button>
             </div>
             <div class="fb-lib-detail" id="fb-lib-detail">
               <pre id="fb-lib-detail-text">—</pre>
@@ -2410,7 +2627,7 @@
           </div>
           <div class="fb-status-wrap">
             <div class="fb-status-bar" id="fb-status-bar"></div>
-            <div class="fb-status" id="fb-status">就绪</div>
+            <div class="fb-status" id="fb-status" role="status" aria-live="polite">就绪</div>
             <div class="fb-sync-prog" id="fb-sync-prog"><div class="fb-sync-fill" id="fb-sync-fill"></div></div>
           </div>
           <div class="fb-exp" id="fb-exp"></div>
@@ -2426,10 +2643,18 @@
     shadow.getElementById('fb-min').addEventListener('click', () => {
       panelEl.classList.add('collapsed');
       dotEl.classList.add('show');
+      shadow.getElementById('fb-min').setAttribute('aria-expanded', 'false');
     });
     dotEl.addEventListener('click', () => {
       panelEl.classList.remove('collapsed');
       dotEl.classList.remove('show');
+      shadow.getElementById('fb-min').setAttribute('aria-expanded', 'true');
+    });
+    dotEl.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        dotEl.click();
+      }
     });
 
     // --- 拖拽 ---
@@ -2458,6 +2683,7 @@
       if (!el) return;
       const on = loadSettings().autoSubmit;
       el.classList.toggle('on', on);
+      el.setAttribute('aria-pressed', String(on));
       el.textContent = on ? '自动提交 ✓' : '自动提交';
     }
     shadow.getElementById('fb-autosubmit').addEventListener('click', () => {
@@ -2474,6 +2700,7 @@
       if (!el) return;
       const h = loadSettings().handicap;
       el.classList.toggle('on', h.enabled);
+      el.setAttribute('aria-pressed', String(h.enabled));
       el.textContent = h.enabled ? '拟真 ✓' : '拟真';
     }
     function fillHandicapForm() {
@@ -2487,24 +2714,30 @@
     }
     shadow.getElementById('fb-handicap').addEventListener('click', () => {
       const box = shadow.getElementById('fb-hc');
-      box.classList.toggle('open');
+      const open = box.classList.toggle('open');
+      shadow.getElementById('fb-handicap').setAttribute('aria-expanded', String(open));
       if (box.classList.contains('open')) fillHandicapForm();
     });
     shadow.getElementById('hc-close').addEventListener('click', () => {
       shadow.getElementById('fb-hc').classList.remove('open');
+      shadow.getElementById('fb-handicap').setAttribute('aria-expanded', 'false');
     });
     shadow.getElementById('hc-save').addEventListener('click', () => {
       const s = loadSettings();
       const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, Math.floor(v) || 0));
       const delayLo = clamp(Number(shadow.getElementById('hc-delay-lo').value), 0, 60);
       const delayHi = clamp(Number(shadow.getElementById('hc-delay-hi').value), delayLo, 60);
-      const lose = Number(shadow.getElementById('hc-lose').value);
-      const strategy = shadow.getElementById('hc-strategy').value;
-      s.handicap = { enabled: shadow.getElementById('hc-enabled').checked, strategy, delaySecMin: delayLo, delaySecMax: delayHi, loseRate: Number.isFinite(lose) ? lose : 0 };
+      const loseRaw = Number(shadow.getElementById('hc-lose').value);
+      const lose = Number.isFinite(loseRaw) ? Math.min(0.4, Math.max(0, loseRaw)) : HANDICAP_DEFAULT.loseRate;
+      const allowedStrategies = new Set(['conservative', 'balanced', 'aggressive']);
+      const strategyCandidate = shadow.getElementById('hc-strategy').value;
+      const strategy = allowedStrategies.has(strategyCandidate) ? strategyCandidate : HANDICAP_DEFAULT.strategy;
+      s.handicap = { enabled: shadow.getElementById('hc-enabled').checked, strategy, delaySecMin: delayLo, delaySecMax: delayHi, loseRate: lose };
       saveSettings(s);
       updateHandicapButton();
       updateHcLive();
       shadow.getElementById('fb-hc').classList.remove('open');
+      shadow.getElementById('fb-handicap').setAttribute('aria-expanded', 'false');
       const stratName = { conservative: '保守', balanced: '均衡', aggressive: '激进' }[strategy] || '均衡';
       const delayNote = (delayLo === 0 && delayHi === 0) ? '（0~0s = 无额外延迟）' : '';
       setStatus(`拟真模式已${s.handicap.enabled ? '开启' : '关闭'}（${stratName} · 目标自动 · ${delayLo}~${delayHi}s${delayNote} · 放水 ${Math.round(s.handicap.loseRate * 100)}%）`);
@@ -2525,6 +2758,7 @@
       const tg = shadow.getElementById('fb-lib-toggle');
       const open = det.classList.toggle('show');
       tg.textContent = open ? '▴' : '▾';
+      tg.setAttribute('aria-expanded', String(open));
       if (open) updateLibSummary();
     });
     setStatus(statusLine);
@@ -2535,7 +2769,8 @@
     if (!panelRoot) return;
     panelRoot.getElementById('fb-mode').textContent = MODE_NAMES[info.mode] || info.mode || '多人';
     // 拟真进度：探路(turn<minG-1) / 逼近(turn==minG-1) / 锁定(候选==1) / 收尾(turn>=minG)
-    let candText = `候选 ${info.cands}/${info.total} · 已猜 ${info.turn}/${info.max}`;
+    const poolLabel = info.poolExact === false ? '全量回退' : '难度池';
+    let candText = `候选 ${info.cands}/${info.total} · ${poolLabel} · 已猜 ${info.turn}/${info.max}`;
     if (info.twinLocked) candText += ' · 双胞胎锁死';
     if (info.handicap) {
       const { turn, minG, cands } = info.handicap;
@@ -2561,10 +2796,12 @@
     const stats = loadStats();
     const m = stats.modes[info.mode];
     if (m && m.games > 0) {
+      const attempted = attemptedSummary(m);
       const top = Object.entries(m.answers).sort((a, b) => b[1] - a[1]).slice(0, 3)
         .map(([n, c]) => `<li>${n} ×${c}</li>`).join('');
       panelRoot.getElementById('fb-exp').innerHTML =
-        `${m.games} 局 · 胜 ${m.wins}（${Math.round(100 * m.wins / m.games)}%）· 均 ${(m.guesses / m.games).toFixed(1)} 步` +
+        `${m.games} 局 · 胜 ${m.wins}（${Math.round(100 * m.wins / m.games)}%）· 有效均 ${attempted.attemptedGames ? (attempted.attemptedGuesses / attempted.attemptedGames).toFixed(1) : '-'} 步` +
+        (attempted.skipped ? ` · 跳过 ${attempted.skipped}` : '') +
         (top ? `<ul>${top}</ul>` : '');
     } else {
       panelRoot.getElementById('fb-exp').textContent = '';
@@ -2583,6 +2820,14 @@
     s.autoSubmit = !s.autoSubmit;
     saveSettings(s);
     setStatus(`自动提交已${s.autoSubmit ? '开启' : '关闭'}`);
+    if (panelRoot) {
+      const el = panelRoot.getElementById('fb-autosubmit');
+      if (el) {
+        el.classList.toggle('on', s.autoSubmit);
+        el.setAttribute('aria-pressed', String(s.autoSubmit));
+        el.textContent = s.autoSubmit ? '自动提交 ✓' : '自动提交';
+      }
+    }
   });
   GM_registerMenuCommand('切换拟真模式', () => {
     const s = loadSettings();
@@ -2591,7 +2836,12 @@
     setStatus(`拟真模式已${s.handicap.enabled ? '开启' : '关闭'}`);
     if (panelRoot) {
       const el = panelRoot.getElementById('fb-handicap');
-      if (el) { el.classList.toggle('on', s.handicap.enabled); el.textContent = s.handicap.enabled ? '拟真 ✓' : '拟真'; }
+      if (el) {
+        el.classList.toggle('on', s.handicap.enabled);
+        el.setAttribute('aria-pressed', String(s.handicap.enabled));
+        el.textContent = s.handicap.enabled ? '拟真 ✓' : '拟真';
+      }
+      updateHcLive();
     }
   });
   GM_registerMenuCommand('重置拟真人格', () => {
