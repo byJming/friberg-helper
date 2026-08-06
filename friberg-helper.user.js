@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         弗一把助手
 // @namespace    shnlfriberg.helper
-// @version      0.10.0
+// @version      0.11.0
 // @description  弗一把(CSGO 选手猜测)开源辅助：求解最优猜测并填入输入框，单人与多人联机自动接管，提交与否由你决定；首次自动拉取仓库数据，支持本地 JSON 导入与服务器增量同步
 // @match        https://shnlfriberg.online/*
 // @homepageURL  https://github.com/byJming/friberg-helper
@@ -25,6 +25,7 @@
   const KEY_STATS = 'friberg.stats.v1';
   const KEY_SETTINGS = 'friberg.settings.v1';
   const KEY_SERVERSYNC = 'friberg.serversync.v1'; // 服务器同步进度：{version, synced:{nick:true}}
+  const KEY_PERSONA = 'friberg.persona.v1'; // 拟真人格向量：安装级持久化，伪装成固定的"某一个人"
 
   // 数据来源优先级：服务器 > 用户导入 > 仓库自动拉取。冲突时高优先级覆盖低优先级；
   // 任何来源都不会清空既有数据（增量合并，不冲突互相补充）。
@@ -54,7 +55,9 @@
     _statsCache = stats;
     try { GM_setValue(KEY_STATS, stats); } catch (e) { /* quota */ }
   }
-  const HANDICAP_DEFAULT = { enabled: false, minGuessesMin: 2, minGuessesMax: 4, delaySecMin: 5, delaySecMax: 12, loseRate: 0.2 };
+  // 拟真模式（反检测）默认值：策略预设 + 延迟区间 + 放水率。
+  // 最少猜测目标不再手配——由候选池规模/历史均步/策略自动推算，避免固定参数成为跨局指纹。
+  const HANDICAP_DEFAULT = { enabled: false, strategy: 'balanced', delaySecMin: 4, delaySecMax: 14, loseRate: 0.15 };
   function loadSettings() {
     if (_settingsCache) return _settingsCache;
     try {
@@ -65,10 +68,7 @@
       else {
         // 兼容旧版固定值格式：迁移为区间
         const h = s.handicap;
-        if (h.minGuessesMin === undefined) {
-          const old = h.minGuesses || 3;
-          h.minGuessesMin = Math.max(1, old - 1);
-          h.minGuessesMax = Math.min(6, old + 1);
+        if (h.minGuessesMin === undefined && h.minGuesses !== undefined) {
           delete h.minGuesses;
         }
         if (h.delaySecMin === undefined) {
@@ -77,6 +77,9 @@
           h.delaySecMax = Math.min(20, old + 3);
           delete h.delaySec;
         }
+        // v0.11.0：移除手配最少猜测；补齐策略预设
+        delete h.minGuessesMin; delete h.minGuessesMax;
+        if (!h.strategy) h.strategy = 'balanced';
       }
       _settingsCache = s;
       return s;
@@ -156,7 +159,7 @@
   // ① id 隔离位（猜测即答案时单独成区，匹配服务端最优增益基准）；
   // ② 国籍 3 级折叠地区（同国/异国同区/异国异区），多人面板无独立地区列亦能正确分区；
   // ③ 队伍 3 级（同队/前队友/无关），历史队伍缺失时自然退化为 0/2 两级；
-  // ④ 数值 5 级含方向。分区等价 ⇒ 内部信息增益/百分位计算与服务端一致，governor 可真实控场。
+  // ④ 数值 5 级含方向。分区等价 ⇒ 内部信息增益/百分位计算与服务端一致，governor 可真实拟真。
   function feedbackKey(enc, g, a) {
     let k = g === a ? 1 : 0; // id 隔离位
     const nat = enc.nats[g] === enc.nats[a] ? 2 : enc.regs[g] === enc.regs[a] ? 1 : 0;
@@ -316,6 +319,11 @@
     roundCloseTeams: [], // 本回合队伍黄格证据（待回合答案揭示后归档）
     bestGreens: 0,
     roundMinGuesses: 0,
+    afkPending: false,  // 本回合 AFK 长停顿配额（触发时机在延迟模型里掷）
+    lastGreens: 0,      // 最近一手反馈绿格数（延迟模型的反馈耦合输入）
+    confusedLeft: 0,    // 困惑状态剩余手数（成簇错误：人类失误是相关的）
+    afkDone: false,     // 本回合是否已插入 AFK 级停顿
+    rhythm: [],         // 最近几手提交延迟（秒），用于连击后犹豫的节奏建模
     awaitingRow: false,
     awaitingRowAt: 0,
     pendingIdx: -1,
@@ -324,10 +332,10 @@
   };
 
   // === CORE-BEGIN ===
-  // 纯决策核心（无 DOM/GM 依赖）。computeMultiFill 与仿真测试共用此区段。
-  // 控场目标：像真人一样逐步逼近答案——开局猜知名选手、中段按反馈收敛、
-  // 确认答案后在到达最小猜测次数前用「近似答案」递补（绝不提前提交）。
-  // 反检测：以服务端 entropyPercentile 为目标的带内采样，避免持续 top-1。
+  // 纯决策核心（无 DOM 依赖）。computeMultiFill 与仿真测试共用此区段。
+  // 拟真目标：像真人一样逐步逼近答案——开局猜知名选手、中段按反馈收敛、
+  // 确认答案后在到达最少猜测目标前用「近似答案」递补（绝不提前提交）。
+  // 反检测：以服务端 entropyPercentile 为目标的带内采样 + 直觉手/困惑簇，避免持续 top-1。
 
   // 计算选手 a 相对于选手 b 的逐属性反馈等级向量（精确复刻服务端着色）。
   // 返回 8 元素数组，每元素 0=green, 1=yellow(close), 2=red(wrong)。
@@ -379,7 +387,7 @@
     return (p.majorAppearances || 0) + (p.majorChampionships || 0) * 4 + (p.isActive ? 2 : 0) + 1;
   }
 
-  // 最可能是答案的候选（历史经验 + 流行度），用于控场禁胜窗口排除
+  // 最可能是答案的候选（历史经验 + 流行度），用于拟真禁胜窗口排除
   function modalCandidate(cands, guessed) {
     const avail = cands.filter(c => !guessed.has(c));
     if (!avail.length) return -1;
@@ -524,12 +532,12 @@
     return top[top.length - 1].g;
   }
 
-  // 确认答案后的「近似答案」递补：猜与答案属性差异 1-4 的未猜选手，
-  // 营造「在相似选手之间犹豫」的自然观感，绝不提交已确认的答案。
-  // 绿色单调性保证：near-miss 的绿色格数 ≥ bestGreens（历史最高），且逐步递增，
-  // 实现「面板逐渐变绿」的自然效果。remainingFill 控制递增步幅。
+  // 确认答案后的垫刀：猜与答案属性相近的未猜选手，绝不提交已确认的答案。
+  // v0.11.0 人类化：偏好同国籍/同队/年龄近的「真人真会混淆」簇，而非纯属性距离最小；
+  // 偶发放宽绿色单调（回退 ≤2 格），零回退垫刀序列是强机器指纹。
   function pickNearMiss(answerIdx, excluded, bestGreens, remainingFill, avoid) {
     const avoidSet = avoid instanceof Set ? avoid : null;
+    const p = loadPersona();
     const cand = all
       .filter(c => !excluded.has(c) && c !== answerIdx && (!avoidSet || !avoidSet.has(c)))
       .map(c => ({ c, d: guessDistance(c, answerIdx), g: attrLevels(c, answerIdx).filter(v => v === 0).length }))
@@ -538,8 +546,18 @@
       const any = all.filter(c => !excluded.has(c) && c !== answerIdx);
       return any.length ? any[Math.floor(Math.random() * any.length)] : -1;
     }
-    // 绿色单调性：优先 green ≥ bestGreens 的候选，避免面板绿格回退
-    if (bestGreens > 0) {
+    // 混淆度打分：人类在「同国籍/同队/年龄近」的选手之间犹豫，而非全局最近邻
+    for (const x of cand) {
+      let s = 8 - x.d;
+      if (enc.nats[x.c] === enc.nats[answerIdx]) s += 3;
+      if (enc.teams[x.c] === enc.teams[answerIdx]) s += 2;
+      else if (enc.ths[answerIdx] && enc.ths[answerIdx].has(enc.teams[x.c])) s += 1.5;
+      if (Math.abs(enc.ages[x.c] - enc.ages[answerIdx]) <= AGE_CLOSE) s += 1;
+      x.s = s;
+    }
+    // 绿色单调性：优先 green ≥ bestGreens 的候选；小概率放宽制造 1~2 格自然回退
+    const allowRegress = Math.random() < (p.regressRate * 2 + 0.04);
+    if (bestGreens > 0 && !allowRegress) {
       const mono = cand.filter(x => x.g >= bestGreens);
       if (mono.length >= 1) {
         // 渐进递增：根据剩余填充次数均匀分配 green 增量，实现平滑变绿
@@ -548,24 +566,20 @@
         const targetCeil = remainingFill > 1 ? Math.min(maxGreen, bestGreens + step) : maxGreen;
         const progressive = mono.filter(x => x.g >= bestGreens && x.g <= targetCeil);
         const pool = progressive.length >= 2 ? progressive : mono;
-        pool.sort((a, b) => a.d - b.d || b.g - a.g);
-        const top = pool.slice(0, Math.min(8, pool.length));
-        const w = top.map((_, i) => top.length - i);
-        const sum = w.reduce((a, b) => a + b, 0);
-        let r = Math.random() * sum, acc = 0;
-        for (let i = 0; i < top.length; i++) { acc += w[i]; if (r <= acc) return top[i].c; }
-        return top[top.length - 1].c;
+        return weightedPickBy(pool.map(x => ({ c: x.c, w: Math.max(0.5, x.s) })));
       }
     }
-    // 无 bestGreens 约束或单调候选耗尽：优先选绿格数最高的（把回退幅度压到最小），
-    // 再按距离加权随机；bestGreens=0 时退化为纯距离偏好
-    cand.sort((a, b) => (bestGreens > 0 ? (b.g - a.g) || (a.d - b.d) : a.d - b.d));
-    const top = cand.slice(0, Math.min(8, cand.length));
-    const w = top.map((_, i) => top.length - i);
-    const sum = w.reduce((a, b) => a + b, 0);
+    // 放宽回退或无约束：按混淆度加权随机（回退幅度由打分自然限制，不会大幅跳水）
+    return weightedPickBy(cand.map(x => ({ c: x.c, w: Math.max(0.5, x.s) })));
+  }
+
+  // 按权重加权随机选取（near-miss 与直觉猜测共用的抽样工具）
+  function weightedPickBy(items) {
+    if (!items.length) return -1;
+    const sum = items.reduce((a, x) => a + x.w, 0);
     let r = Math.random() * sum, acc = 0;
-    for (let i = 0; i < top.length; i++) { acc += w[i]; if (r <= acc) return top[i].c; }
-    return top[top.length - 1].c;
+    for (const it of items) { acc += it.w; if (r <= acc) return it.c; }
+    return items[items.length - 1].c;
   }
 
   // 双胞胎簇检测：候选集内所有选手属性两两全同（反馈无法进一步区分）。
@@ -580,8 +594,35 @@
     return true;
   }
 
-  // 控场决策主入口（纯函数：依据传入状态返回猜测索引）。
-  // 非控场模式完全沿用原 pickGuess（excluded 即原版传入的猜测排除集），保障「不影响非控场模式」。
+  // 直觉猜测：真人凭印象/偏好冲一手——同国籍、同队、惯用开局等锚点选手。
+  // 刻意不追求信息增益且容忍绿格回退：零回退是强机器指纹，人类试探性猜测常让面板变差。
+  function pickIntuitionGuess(cands, excluded) {
+    const p = loadPersona();
+    const proxy = modalCandidate(cands, excluded);
+    const pool = all.filter(c => !excluded.has(c) && c !== proxy);
+    if (!pool.length) return -1;
+    const scored = pool.map(c => {
+      let s = playerPopularity(c);
+      if (proxy >= 0) {
+        if (enc.nats[c] === enc.nats[proxy]) s += 12;      // 同国籍锚点：人类最典型的混淆维
+        if (enc.teams[c] === enc.teams[proxy]) s += 10;
+        else if (enc.ths[proxy] && enc.ths[proxy].has(enc.teams[c])) s += 6;
+        if (Math.abs(enc.ages[c] - enc.ages[proxy]) <= AGE_CLOSE) s += 3;
+      }
+      if (p.favReg >= 0 && enc.regs[c] === p.favReg) s += 4;
+      if (p.openers.includes(enc.nicks[c])) s += 8;
+      return { c, s };
+    });
+    scored.sort((a, b) => b.s - a.s);
+    const top = scored.slice(0, Math.min(6, scored.length));
+    const wsum = top.reduce((a, x) => a + x.s, 0);
+    let r = Math.random() * wsum, acc = 0;
+    for (const t of top) { acc += t.s; if (r <= acc) return t.c; }
+    return top[top.length - 1].c;
+  }
+
+  // 拟真决策主入口（传入状态返回猜测索引；运行中会读写 multi 拟真态：困惑计数/目标延长）。
+  // 非拟真模式完全沿用原 pickGuess（excluded 即原版传入的猜测排除集），保障「不影响非拟真模式」。
   function decideMultiGuess(o) {
     const cands = o.candidates;
     const excluded = o.excluded;
@@ -590,43 +631,55 @@
     const remaining = maxGuesses - turn;
     if (!cands.length) return -1;
 
-    // 非控场：行为与原版逐字一致（含 available 兜底，避免候选耗尽时重猜已猜选手）
+    // 非拟真：行为与原版逐字一致（含 available 兜底，避免候选耗尽时重猜已猜选手）
     if (!o.handicapEnabled) {
       const available = cands.filter(c => !excluded.has(c));
       if (!available.length) return all.find(c => !excluded.has(c));
       return pickGuess(enc, cands, cands, excluded, remaining);
     }
 
-    const minG = o.roundMinGuesses;
-    const lastSolveTurn = Math.max(0, minG - 1); // 允许获胜的最后探路回合（0 基）
+    const p = loadPersona();
+    let minG = o.roundMinGuesses;
     const confirmed = cands.length === 1;
     const twinLocked = isTwinCluster(cands); // 属性全同簇：反馈无法进一步区分
     const bestGreens = o.bestGreens || 0;
 
-    // 确认答案（或双胞胎锁死）但未达最小猜测次数：近似答案递补，绝不提交答案
-    if ((confirmed || twinLocked) && turn < minG) {
-      if (twinLocked) {
-        // 双胞胎簇：反馈无法区分，唯一策略是逐一尝试。计算最晚安全开局：
-        // latestStart = maxGuesses - clusterSize，此后每回合必须猜簇内选手否则回合不够。
-        const latestStart = maxGuesses - cands.length;
-        if (turn >= latestStart) {
-          return modalCandidate(cands, excluded);
-        }
-        // 还有余量：near-miss 填充至 latestStart，然后开始枚举
-        const proxy = modalCandidate(cands, excluded);
-        const remainingFill = latestStart - turn;
-        const avoid = new Set(cands);
-        return pickNearMiss(proxy, excluded, bestGreens, remainingFill, avoid);
-      }
-      const remainingFill = minG - turn; // 还需填充几次（含本次）
-      return pickNearMiss(cands[0], excluded, bestGreens, remainingFill);
+    // 双胞胎锁死优先：反馈无法区分，minG 填充不能占用枚举回合
+    if (twinLocked) {
+      const latestStart = maxGuesses - cands.length;
+      if (turn >= latestStart) return modalCandidate(cands, excluded);
+      const proxy = modalCandidate(cands, excluded);
+      const avoid = new Set(cands);
+      return pickNearMiss(proxy, excluded, bestGreens, latestStart - turn, avoid);
     }
-    // 已过最小猜测窗口：正常求解（允许获胜）；确认则提交
+
+    // 困惑状态（成簇错误）：连续数手凭直觉乱猜，容忍绿格回退。
+    // 人类失误是相关的，独立均匀撒错恰是非人类特征；困惑中偶尔直接命中答案也符合真人。
+    if (multi.confusedLeft > 0 && !confirmed && turn < minG) {
+      multi.confusedLeft--;
+      return pickIntuitionGuess(cands, excluded);
+    }
+    // 偶发直觉手：非困惑期小概率冲动猜测，打破「每手信息增益都在目标带内」的机器不变量
+    if (!confirmed && turn > 0 && turn < minG && Math.random() < p.regressRate) {
+      return pickIntuitionGuess(cands, excluded);
+    }
+
+    // 收敛速度自适应：到达目标回合但候选仍多 ⇒ 延长目标继续探路（真人此时不会硬求解）
+    if (!confirmed && turn === minG - 1 && cands.length > 5 && remaining >= 3 && minG < 6) {
+      multi.roundMinGuesses = minG + 1;
+      minG += 1;
+    }
+    const lastSolveTurn = Math.max(0, minG - 1); // 允许获胜的最后探路回合（0 基）
+
+    // 确认答案但未达目标：限次人类式垫刀；垫超 2 手后可能提前收手——真人确认后果断猜出
+    if (confirmed && turn < minG) {
+      if (minG - turn > 2 && Math.random() < 0.45) return cands[0];
+      return pickNearMiss(cands[0], excluded, bestGreens, minG - turn);
+    }
+    // 已过目标窗口：正常求解（允许获胜）；确认则提交
     if (turn >= minG) {
       if (confirmed) return cands[0];
-      // 双胞胎锁死：逐一尝试簇内选手（唯一选项，pickGuess 无法分裂全同簇）
-      if (twinLocked) return modalCandidate(cands, excluded);
-      // 候选数 > 剩余步数时无法逐一枚举，用全局池求解以最大化信息增益（仅控场模式）
+      // 候选数 > 剩余步数时无法逐一枚举，用全局池求解以最大化信息增益（仅拟真模式）
       const solvePool = cands.length > remaining ? all : cands;
       return pickGuess(enc, cands, solvePool, excluded, remaining);
     }
@@ -644,7 +697,7 @@
       if (m >= 0) return m;
     }
     // 败局警戒：候选数 > 剩余步数时，自然猜测的信息增益不足以保证获胜，
-    // 切换到 minimax 全局池求解（仅控场模式，不影响等价性）
+    // 切换到 minimax 全局池求解（仅拟真模式，不影响等价性）
     if (cands.length > remaining) {
       return pickGuess(enc, cands, all, excluded, remaining);
     }
@@ -663,42 +716,155 @@
     return loadSettings().handicap;
   }
 
-  // 每局开始时掷骰：决定本局是否放水、本局最少猜测次数（从用户设定区间内随机）
-  function rollHandicapLose() {
-    const h = handicapConfig();
-    multi.handicapLose = h.enabled && Math.random() < h.loseRate;
-    multi.handicapSkipDone = false;
-    // 从 [minGuessesMin, minGuessesMax] 区间随机取本局最少猜测数
-    const lo = Math.max(1, h.minGuessesMin || 2);
-    const hi = Math.max(lo, Math.min(6, h.minGuessesMax || lo));
-    multi.roundMinGuesses = h.enabled ? lo + Math.floor(Math.random() * (hi - lo + 1)) : 0;
-    return multi.handicapLose;
+  // ---------- 拟真人格（贝叶斯对抗核心） ----------
+  // 检测器按单一主体的 50 局样本估参：固定参数的平稳采样器必被识别。
+  // 解法：每安装一次性采样人格向量并永久落盘——节奏、失误率、困惑率、惯用开局、
+  // 地区偏好各不相同且跨会话稳定，样本看起来来自「一个有个性的人」而非同一策略的多次实例。
+  let _personaCache = null;
+  function loadPersona() {
+    if (_personaCache) return _personaCache;
+    let p = null;
+    try { p = GM_getValue(KEY_PERSONA, null); } catch (e) { /* ignore */ }
+    if (!p || typeof p !== 'object') {
+      p = {
+        pace: 0.85 + Math.random() * 0.4,            // 个人节奏系数
+        regressRate: 0.05 + Math.random() * 0.07,    // 直觉手/绿格回退概率
+        confusionRate: 0.08 + Math.random() * 0.08,  // 本回合进入困惑（成簇错误）概率
+        afkRate: 0.05 + Math.random() * 0.06,        // 本回合出现 AFK 级停顿概率
+        openers: [],                                  // 惯用开局昵称（选手库就绪后惰性生成）
+        favReg: -1,                                   // 偏好地区编码
+        openersReady: false,
+      };
+      try { GM_setValue(KEY_PERSONA, p); } catch (e) { /* quota */ }
+    }
+    _personaCache = p;
+    return p;
+  }
+  // 人格的库相关部分需选手库就绪才能生成：惯用开局取高流行度选手（真人开局高度重复，
+  // 每局随机开场反而是指纹）；地区偏好随机锚定。
+  function ensurePersonaTraits() {
+    const p = loadPersona();
+    if (p.openersReady || !enc || !all.length) return;
+    const ranked = all.slice().sort((a, b) => playerPopularity(b) - playerPopularity(a));
+    const top = ranked.slice(0, Math.min(40, ranked.length));
+    const picked = new Set();
+    while (picked.size < Math.min(4, top.length)) {
+      picked.add(top[Math.floor(Math.random() * top.length)]);
+    }
+    p.openers = [...picked].map(i => enc.nicks[i]);
+    const seed = top[Math.floor(Math.random() * top.length)];
+    p.favReg = enc.regs[seed];
+    p.openersReady = true;
+    try { GM_setValue(KEY_PERSONA, p); } catch (e) { /* quota */ }
   }
 
-  // 提交前延迟（毫秒）—— 人性化「思考时间」模型：
-  // - 区间设为 0~0：不受额外限制，返回 0，实际提交速度等同关闭控场
-  // - 开局（turn 0）偏快：人类有现成的开局选手，反应短
-  // - 中段随候选数对数增长：候选越多越费思量
-  // - 偶发长考（约 12%）：模拟「拿不准、反复权衡」
-  // 始终落在用户设定区间 [lo, hi] 内，候选数与回合只影响区间内偏移，不突破下界。
-  function handicapDelayMs() {
+  // 会话状态：热身/疲劳跨回合累积，打破跨局平稳性（真人有状态起伏）
+  const _sess = { rounds: 0, loseMomentum: 0 };
+
+  // 自动推算本局最少猜测目标（v0.11.0 起不再手配）：
+  // 候选池规模（log2 缩放）与历史均步（足够样本时）各半混合，
+  // 策略预设平移，再掷随机扰动——避免固定目标值成为跨局可估计的参数指纹。
+  function computeRoundTarget(h) {
+    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    const pool = enc ? enc.n : 0;
+    const poolBase = pool > 1 ? clamp(Math.round(Math.log2(pool) / 2), 2, 5) : 3;
+    const m = (loadStats().modes || {})[multi.mode];
+    const histBase = (m && m.games >= 8 && m.games > 0)
+      ? clamp(Math.round(m.guesses / m.games), 2, 6) : poolBase;
+    let base = Math.round((poolBase + histBase) / 2);
+    if (h.strategy === 'conservative') base += 1;
+    else if (h.strategy === 'aggressive') base -= 1;
+    base += Math.random() < 0.55 ? (Math.random() < 0.5 ? -1 : 1) : 0;
+    return clamp(base, 2, 6);
+  }
+
+  // 每回合开始时掷骰：放水（聚簇分布）、困惑状态、AFK 配额、本回合最少猜测目标。
+  function rollRoundProfile() {
+    const h = handicapConfig();
+    const p = loadPersona();
+    ensurePersonaTraits();
+    _sess.rounds += 1;
+    // 放水聚簇：人类状态有惯性（连败/手感热），均匀伯努利放水是采样器指纹。
+    //  momentum>0（近期输过）⇒ 更易继续输；刚赢 ⇒ 放水概率打折，输局自然成串出现。
+    let lose = false;
+    if (h.enabled && h.loseRate > 0) {
+      const rate = _sess.loseMomentum > 0
+        ? Math.min(0.6, h.loseRate * (1.2 + 0.4 * _sess.loseMomentum))
+        : h.loseRate * 0.7;
+      lose = Math.random() < rate;
+    }
+    _sess.loseMomentum = lose ? _sess.loseMomentum + 1 : Math.max(0, _sess.loseMomentum - 1);
+    multi.handicapLose = lose;
+    multi.handicapSkipDone = false;
+    multi.roundMinGuesses = h.enabled ? computeRoundTarget(h) : 0;
+    // 困惑状态：触发后连续 2~3 手成簇变差；放水局不困惑（直接跳过）
+    multi.confusedLeft = (h.enabled && !lose && Math.random() < p.confusionRate)
+      ? 2 + Math.floor(Math.random() * 2) : 0;
+    // AFK 配额：整回合至多一次长停顿，触发时机在延迟模型里掷
+    multi.afkPending = h.enabled && !lose && Math.random() < p.afkRate;
+    multi.afkDone = false;
+    multi.lastGreens = 0;
+    multi.rhythm = [];
+    return lose;
+  }
+
+  // 标准正态（Box-Muller）：人类反应时近似 log-normal/ex-Gaussian，均匀分布是机器指纹
+  function randNorm() {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+
+  // 提交前延迟（毫秒）—— v0.11.0 思考时间模型（对抗 guessTimesMs 序列分析）：
+  // 1) log-normal 基础分布（右偏长尾），中位由延迟区间与人格节奏决定；
+  // 2) 反馈耦合：上一手绿格多 ⇒ 停下来读面板；全红 ⇒ 快换思路或长考（真人阅读反馈的节奏）；
+  // 3) 选手耦合：所选猜测越冷门，「回忆」越久；
+  // 4) 连击后犹豫：连续两手偏快 ⇒ 本手大幅变慢（真人节奏不均匀，快慢成对出现）；
+  // 5) 偶发 AFK 级停顿（可突破区间上限）；6) 会话热身/疲劳漂移。
+  // 0~0 区间 = 不额外延迟（提交速度等同关闭拟真，仅受冷却约束）。
+  function handicapDelayMs(gIdx) {
     const h = handicapConfig();
     if (!h.enabled) return 0;
     const lo = Math.max(0, h.delaySecMin || 0);
-    // 0~0 秒 = 不增加额外提交延迟（提交速度等同关闭控场，仅受冷却约束）
-    if (lo === 0 && Math.max(0, h.delaySecMax || 0) === 0) return 0;
-    const hi = Math.max(lo + 1, h.delaySecMax || lo + 1);
-    const cands = multi.candidates.length;
+    const hiCap = Math.max(0, h.delaySecMax || 0);
+    if (lo === 0 && hiCap === 0) return 0;
+    const hi = Math.max(lo + 1, hiCap);
+    const p = loadPersona();
+    // AFK：长停顿必须混入时间序列才有意义，一旦触发必突破常规区间
+    if (multi.afkPending && !multi.afkDone && Math.random() < 0.16) {
+      multi.afkDone = true;
+      return (30 + Math.random() * 60) * 1000;
+    }
     const turn = multi.turn;
-    // 候选数对数映射到区间内的基础位置（候选多→偏上界）
-    const candPos = cands > 1 ? Math.min(1, Math.log2(cands) / 10) : 0.1;
-    // 回合修正：开局更快（-0.2），后期略慢（+0.1）
-    const turnAdj = turn === 0 ? -0.2 : Math.min(0.15, turn * 0.03);
-    let bias = Math.max(0.05, Math.min(0.95, candPos + turnAdj + (Math.random() - 0.5) * 0.25));
-    // 偶发长考：约 12% 概率把延迟推到区间上段
-    if (Math.random() < 0.12) bias = Math.max(bias, 0.75 + Math.random() * 0.2);
-    const sec = lo + (hi - lo) * bias;
-    return Math.max(lo * 1000, Math.round(sec * 1000));
+    const cands = multi.candidates.length;
+    let mu = Math.log(Math.max(2, (lo + hi) / 2));
+    mu += Math.log(p.pace);
+    mu += cands > 1 ? Math.min(0.35, Math.log2(cands) / 25) : -0.12;
+    mu += turn === 0 ? -0.3 : Math.min(0.2, turn * 0.04);
+    // 反馈耦合（读面板/消化信息）
+    const lg = multi.lastGreens || 0;
+    if (lg >= 5) mu += 0.35 + Math.random() * 0.2;
+    else if (lg === 0 && turn > 0) mu += Math.random() < 0.4 ? 0.3 : -0.15;
+    // 选手冷门度耦合：流行度越低「回忆」越慢
+    if (gIdx >= 0 && enc) {
+      const pop = playerPopularity(gIdx);
+      mu += Math.max(0, Math.min(0.3, (7 - pop) * 0.05));
+    }
+    // 连击后犹豫：最近两手都明显偏快 ⇒ 真人必然慢下来权衡
+    const rh = multi.rhythm;
+    if (rh.length >= 2) {
+      const mid = (lo + hi) / 2;
+      if (rh[rh.length - 1] < mid * 0.55 && rh[rh.length - 2] < mid * 0.55) mu += 0.55 + Math.random() * 0.35;
+    }
+    // 会话漂移：开局热身偏慢，长会话疲劳后略快且随意
+    if (_sess.rounds <= 2) mu += 0.15;
+    else if (_sess.rounds > 14) mu -= 0.08;
+    const sec = Math.exp(mu + 0.45 * randNorm());
+    const out = Math.max(lo, Math.min(hi, sec)) * 1000;
+    rh.push(out / 1000);
+    if (rh.length > 4) rh.shift();
+    return Math.round(out);
   }
 
   // 放水：点击"跳过本局"按钮（lucide-skip-forward 图标定位，语言无关）。
@@ -759,7 +925,7 @@
     multi.handicapPlan = newHandicapPlan();
     multi.bestGreens = 0;
     multi.roundCloseTeams = [];
-    rollHandicapLose();
+    rollRoundProfile();
   }
 
   // 重新导入选手库后重置单人/多人对局状态（与原 resetMultiAfterDataSync 合并入口）。
@@ -1585,8 +1751,8 @@
     // 放水局：不填不猜，等 pollMulti 点「跳过本局」
     if (multi.handicapLose) return;
     const h = handicapConfig();
-    // 非控场排除集与原版逐字一致（guessed∪submitted，不含 pending），
-    // 控场排除集额外含 pendingIdx，避免重提未确认的猜测
+    // 非拟真排除集与原版逐字一致（guessed∪submitted，不含 pending），
+    // 拟真排除集额外含 pendingIdx，避免重提未确认的猜测
     const pendingSet = multi.pendingIdx >= 0 ? [multi.pendingIdx] : [];
     const excluded = h.enabled
       ? new Set([...multi.guessed, ...multi.submitted, ...pendingSet])
@@ -1634,7 +1800,7 @@
         expected: nickname,
         lastClick: 0,
         nextAttemptAt: 0,
-        delayUntil: Date.now() + handicapDelayMs(),
+        delayUntil: Date.now() + handicapDelayMs(multi.lastIdx),
       };
       void waitSubmitButton(nickname);
     }
@@ -1774,9 +1940,10 @@
         }
         multi.guessed.add(gIdx);
         multi.submitted.add(gIdx);
-        // 追踪历史最高绿色格数，用于控场绿色单调性
+        // 追踪历史最高绿色格数，用于拟真绿色单调性
         const greens = row.querySelectorAll('td.correct').length;
         if (greens > multi.bestGreens) multi.bestGreens = greens;
+        multi.lastGreens = greens; // 最近一手反馈（延迟模型的耦合输入）
       } else {
         setStatus(`多人：无法识别猜测「${nick}」，请同步数据`);
       }
@@ -2057,6 +2224,27 @@
     }
   }
 
+  // 拟真实时状态：展示当前回合自动推算的猜测目标，直观反映「自动计算」运行态。
+  // 模块级：createPanel 表单与 renderPanel 决策刷新均需调用。
+  function updateHcLive() {
+    if (!panelRoot) return;
+    const el = panelRoot.getElementById('hc-live');
+    if (!el) return;
+    const h = loadSettings().handicap;
+    if (!h.enabled) {
+      el.textContent = '拟真模式未启用：猜测目标、失误与停顿均不介入';
+      el.classList.add('idle');
+      return;
+    }
+    el.classList.remove('idle');
+    const stratName = { conservative: '保守', balanced: '均衡', aggressive: '激进' }[h.strategy] || '均衡';
+    if (multi.active && !multi.ended && multi.roundMinGuesses > 0) {
+      el.textContent = `拟真运行中 · 本回合目标 ${multi.roundMinGuesses} 猜 · ${stratName}策略自动计算`;
+    } else {
+      el.textContent = `拟真已启用 · ${stratName}策略 · 目标按池规模/历史均步自动计算`;
+    }
+  }
+
   function createPanel() {
     const host = document.createElement('div');
     host.id = 'friberg-helper';
@@ -2090,9 +2278,9 @@
         .fb-toggle{flex:1;padding:6px 0;border-radius:8px;border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.03);color:#8b95a5;cursor:pointer;font-size:11px;font-weight:500;text-align:center;transition:all .18s}
         .fb-toggle:hover{background:rgba(255,255,255,.07);color:#c8cdd6}
         .fb-toggle.on{background:rgba(110,231,160,.1);border-color:rgba(110,231,160,.25);color:#6ee7a0}
-        /* 控场配置抽屉 */
+        /* 拟真配置抽屉 */
         .fb-hc{max-height:0;overflow:hidden;transition:max-height .3s ease,opacity .25s;opacity:0;margin-bottom:0}
-        .fb-hc.open{max-height:220px;opacity:1;margin-bottom:10px}
+        .fb-hc.open{max-height:260px;opacity:1;margin-bottom:10px}
         .fb-hc-inner{padding:10px;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);border-radius:10px}
         .fb-hc-inner label{display:flex;justify-content:space-between;align-items:center;margin:5px 0;font-size:11px;color:#9aa3b2}
         .fb-hc .range-row{display:flex;align-items:center;gap:3px}
@@ -2103,6 +2291,8 @@
         .fb-hc-btns{display:flex;gap:6px;margin-top:8px}
         .fb-hc-btns button{flex:1;padding:5px 0;border-radius:7px;border:0;cursor:pointer;font-size:11px;font-weight:500;color:#fff;transition:filter .15s}
         .fb-hc-btns button:hover{filter:brightness(1.15)}
+        .fb-hc-live{font-size:10px;color:#6ee7a0;background:rgba(110,231,160,.07);border:1px solid rgba(110,231,160,.15);padding:4px 8px;border-radius:8px;margin-bottom:5px;line-height:1.4;transition:all .2s}
+        .fb-hc-live.idle{color:#8b95a5;background:rgba(255,255,255,.02);border-color:rgba(255,255,255,.06)}
         /* 选手库数据卡片（导入/同步/仓库拉取 + 数据说明 合并） */
         .fb-libcard{background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:8px 9px;margin-bottom:10px}
         .fb-lib-head{display:flex;align-items:center;gap:7px;margin-bottom:7px}
@@ -2156,21 +2346,28 @@
           </div>
           <div class="fb-toggles">
             <button class="fb-toggle" id="fb-autosubmit">自动提交</button>
-            <button class="fb-toggle" id="fb-handicap">控场</button>
+            <button class="fb-toggle" id="fb-handicap">拟真</button>
           </div>
           <div class="fb-hc" id="fb-hc">
             <div class="fb-hc-inner">
-              <label><span>启用控场</span><input type="checkbox" id="hc-enabled"></label>
-              <label><span>最少猜测</span><span class="range-row"><input type="number" id="hc-min-lo" min="1" max="6" step="1"><span>~</span><input type="number" id="hc-min-hi" min="1" max="6" step="1"><span>次</span></span></label>
-              <label title="0~0 秒 = 无额外延迟，提交速度等同关闭控场"><span>提交延迟</span><span class="range-row"><input type="number" id="hc-delay-lo" min="0" max="20" step="1"><span>~</span><input type="number" id="hc-delay-hi" min="0" max="20" step="1"><span>秒</span></span></label>
+              <label><span>启用拟真模式</span><input type="checkbox" id="hc-enabled"></label>
+              <label title="猜测目标、失误节奏、停顿均由脚本自动推算"><span>策略</span>
+                <select id="hc-strategy">
+                  <option value="conservative">保守 · 慢收敛更像新人</option>
+                  <option value="balanced">均衡 · 自适应（推荐）</option>
+                  <option value="aggressive">激进 · 快收敛胜率优先</option>
+                </select>
+              </label>
+              <div class="fb-hc-live" id="hc-live">最少猜测自动适应池规模与历史均步</div>
+              <label title="0~0 秒 = 无额外延迟，提交速度等同关闭拟真"><span>提交延迟</span><span class="range-row"><input type="number" id="hc-delay-lo" min="0" max="60" step="1"><span>~</span><input type="number" id="hc-delay-hi" min="0" max="60" step="1"><span>秒</span></span></label>
               <label><span>放水概率</span>
                 <select id="hc-lose">
                   <option value="0">0%</option>
                   <option value="0.1">10%</option>
+                  <option value="0.15">15%（推荐）</option>
                   <option value="0.2">20%</option>
                   <option value="0.3">30%</option>
                   <option value="0.4">40%</option>
-                  <option value="0.5">50%</option>
                 </select>
               </label>
               <div class="fb-hc-btns">
@@ -2260,16 +2457,16 @@
       if (!el) return;
       const h = loadSettings().handicap;
       el.classList.toggle('on', h.enabled);
-      el.textContent = h.enabled ? '控场 ✓' : '控场';
+      el.textContent = h.enabled ? '拟真 ✓' : '拟真';
     }
     function fillHandicapForm() {
       const h = loadSettings().handicap;
       shadow.getElementById('hc-enabled').checked = h.enabled;
-      shadow.getElementById('hc-min-lo').value = h.minGuessesMin;
-      shadow.getElementById('hc-min-hi').value = h.minGuessesMax;
+      shadow.getElementById('hc-strategy').value = h.strategy || 'balanced';
       shadow.getElementById('hc-delay-lo').value = h.delaySecMin;
       shadow.getElementById('hc-delay-hi').value = h.delaySecMax;
       shadow.getElementById('hc-lose').value = String(h.loseRate);
+      updateHcLive();
     }
     shadow.getElementById('fb-handicap').addEventListener('click', () => {
       const box = shadow.getElementById('fb-hc');
@@ -2282,17 +2479,18 @@
     shadow.getElementById('hc-save').addEventListener('click', () => {
       const s = loadSettings();
       const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, Math.floor(v) || 0));
-      const minLo = clamp(Number(shadow.getElementById('hc-min-lo').value), 1, 6);
-      const minHi = clamp(Number(shadow.getElementById('hc-min-hi').value), minLo, 6);
-      const delayLo = clamp(Number(shadow.getElementById('hc-delay-lo').value), 0, 20);
-      const delayHi = clamp(Number(shadow.getElementById('hc-delay-hi').value), delayLo, 20);
+      const delayLo = clamp(Number(shadow.getElementById('hc-delay-lo').value), 0, 60);
+      const delayHi = clamp(Number(shadow.getElementById('hc-delay-hi').value), delayLo, 60);
       const lose = Number(shadow.getElementById('hc-lose').value);
-      s.handicap = { enabled: shadow.getElementById('hc-enabled').checked, minGuessesMin: minLo, minGuessesMax: minHi, delaySecMin: delayLo, delaySecMax: delayHi, loseRate: Number.isFinite(lose) ? lose : 0 };
+      const strategy = shadow.getElementById('hc-strategy').value;
+      s.handicap = { enabled: shadow.getElementById('hc-enabled').checked, strategy, delaySecMin: delayLo, delaySecMax: delayHi, loseRate: Number.isFinite(lose) ? lose : 0 };
       saveSettings(s);
       updateHandicapButton();
+      updateHcLive();
       shadow.getElementById('fb-hc').classList.remove('open');
-      const delayNote = (minLo >= 0 && delayLo === 0 && delayHi === 0) ? '（0~0s = 无额外延迟）' : '';
-      setStatus(`控场已${s.handicap.enabled ? '开启' : '关闭'}（${minLo}~${minHi} 猜 · ${delayLo}~${delayHi}s${delayNote} · 放水 ${Math.round(s.handicap.loseRate * 100)}%）`);
+      const stratName = { conservative: '保守', balanced: '均衡', aggressive: '激进' }[strategy] || '均衡';
+      const delayNote = (delayLo === 0 && delayHi === 0) ? '（0~0s = 无额外延迟）' : '';
+      setStatus(`拟真模式已${s.handicap.enabled ? '开启' : '关闭'}（${stratName} · 目标自动 · ${delayLo}~${delayHi}s${delayNote} · 放水 ${Math.round(s.handicap.loseRate * 100)}%）`);
     });
     updateHandicapButton();
 
@@ -2319,15 +2517,17 @@
   function renderPanel(info) {
     if (!panelRoot) return;
     panelRoot.getElementById('fb-mode').textContent = MODE_NAMES[info.mode] || info.mode || '多人';
-    // 控场进度：探路(turn<minG-1) / 逼近(turn==minG-1) / 锁定(候选==1) / 收尾(turn>=minG)
+    // 拟真进度：探路(turn<minG-1) / 逼近(turn==minG-1) / 锁定(候选==1) / 收尾(turn>=minG)
     let candText = `候选 ${info.cands}/${info.total} · 已猜 ${info.turn}/${info.max}`;
     if (info.twinLocked) candText += ' · 双胞胎锁死';
     if (info.handicap) {
       const { turn, minG, cands } = info.handicap;
       const phase = cands <= 1 ? '锁定' : turn < minG - 1 ? '探路' : turn < minG ? '逼近' : '收尾';
-      candText += ` · 控场 ${phase} ${turn}/${minG}`;
+      candText += ` · 拟真 ${phase} ${turn}/${minG}`;
     }
     panelRoot.getElementById('fb-cand').textContent = candText;
+    // 拟真实时状态行随每次决策刷新（目标值为自动计算结果）
+    updateHcLive();
     // 候选收敛进度条：已排除的候选占比（0%→100%）
     const convPct = info.total > 0 ? Math.round(100 * (1 - info.cands / info.total)) : 0;
     const convBar = panelRoot.getElementById('fb-conv-bar');
@@ -2366,6 +2566,22 @@
     s.autoSubmit = !s.autoSubmit;
     saveSettings(s);
     setStatus(`自动提交已${s.autoSubmit ? '开启' : '关闭'}`);
+  });
+  GM_registerMenuCommand('切换拟真模式', () => {
+    const s = loadSettings();
+    s.handicap.enabled = !s.handicap.enabled;
+    saveSettings(s);
+    setStatus(`拟真模式已${s.handicap.enabled ? '开启' : '关闭'}`);
+    if (panelRoot) {
+      const el = panelRoot.getElementById('fb-handicap');
+      if (el) { el.classList.toggle('on', s.handicap.enabled); el.textContent = s.handicap.enabled ? '拟真 ✓' : '拟真'; }
+    }
+  });
+  GM_registerMenuCommand('重置拟真人格', () => {
+    // 人格向量按安装固化；换号/换环境使用时可重掷一套新个性
+    try { GM_setValue(KEY_PERSONA, null); } catch (e) { /* ignore */ }
+    _personaCache = null;
+    setStatus('拟真人格已重置，下回合生效');
   });
   GM_registerMenuCommand('导入本地 JSON 数据', importFromFile);
   GM_registerMenuCommand('同步服务器选手库', () => { if (!(_syncState && _syncState.running)) syncFromServer(); });
